@@ -32,6 +32,10 @@ async function getTokenSupply(address) {
   }
 }
 
+function safeBigInt(val) {
+  try { return BigInt(val || 0); } catch { return 0n; }
+}
+
 export function watchToken(tokenAddress, deployBlock, name, symbol) {
   if (watchedTokens.has(tokenAddress.toLowerCase())) return;
 
@@ -60,26 +64,39 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
 
         console.log('First buy found for ' + tokenAddress);
 
-        const ethPrice = await getEthPrice();
-        const ethAmt = parseFloat(formatEther(log.args.amount1In > 0n ? log.args.amount1In : log.args.amount0In));
-        const usdAmount = (ethAmt * ethPrice).toFixed(2);
+        try {
+          const ethPrice = await getEthPrice();
 
-        const totalSupply = await getTokenSupply(tokenAddress);
-        const supplyNum = parseFloat(formatEther(totalSupply));
-        const tokensBought = parseFloat(formatEther(log.args.amount0Out > 0n ? log.args.amount0Out : log.args.amount1Out));
-        const tokenPriceUsd = tokensBought > 0 ? (ethAmt * ethPrice) / tokensBought : 0;
-        const mcap = (supplyNum * tokenPriceUsd).toFixed(0);
+          const a0in = safeBigInt(log.args.amount0In);
+          const a1in = safeBigInt(log.args.amount1In);
+          const a0out = safeBigInt(log.args.amount0Out);
+          const a1out = safeBigInt(log.args.amount1Out);
 
-        await sendAlert({
-          tokenAddress,
-          tokenName: state.name || 'Unknown',
-          tokenSymbol: state.symbol || '???',
-          buyerAddress: log.args.to,
-          ethAmount: ethAmt.toFixed(4),
-          usdAmount,
-          mcap,
-          txHash: log.transactionHash,
-        });
+          const ethIn = a0in < a1in ? a0in : a1in;
+          const tokensOut = a0out > a1out ? a0out : a1out;
+
+          const ethAmt = parseFloat(formatEther(ethIn));
+          const usdAmount = (ethAmt * ethPrice).toFixed(2);
+
+          const totalSupply = await getTokenSupply(tokenAddress);
+          const supplyNum = parseFloat(formatEther(totalSupply));
+          const tokensBought = parseFloat(formatEther(tokensOut));
+          const tokenPriceUsd = tokensBought > 0 ? (ethAmt * ethPrice) / tokensBought : 0;
+          const mcap = supplyNum > 0 && tokenPriceUsd > 0 ? '$' + Math.round(supplyNum * tokenPriceUsd).toLocaleString() : 'N/A';
+
+          await sendAlert({
+            tokenAddress,
+            tokenName: state.name || 'Unknown',
+            tokenSymbol: state.symbol || '???',
+            buyerAddress: log.args.to,
+            ethAmount: ethAmt.toFixed(4),
+            usdAmount,
+            mcap,
+            txHash: log.transactionHash,
+          });
+        } catch (err) {
+          console.log('Error processing swap: ' + err.message);
+        }
 
         state.unwatch?.();
         watchedTokens.delete(tokenAddress.toLowerCase());
