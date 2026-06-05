@@ -4,14 +4,15 @@ dotenv.config();
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-export async function sendAlert({ tokenAddress, tokenName, tokenSymbol, buyerAddress, amountIn, txHash }) {
+export async function sendAlert({ tokenAddress, tokenName, tokenSymbol, buyerAddress, ethAmount, usdAmount, mcap, txHash }) {
   const msg = `
 🟢 *First Buy Detected on Base!*
 
 🪙 Token: \`${tokenName}\` (${tokenSymbol})
 📍 Contract: \`${tokenAddress}\`
 👤 Buyer: \`${buyerAddress}\`
-💰 ETH spent: ${amountIn} ETH
+💰 Buy Amount: ${ethAmount} ETH ($${usdAmount})
+📊 Market Cap: $${Number(mcap).toLocaleString()}
 
 🔗 [View on Basescan](https://basescan.org/tx/${txHash})
 🦅 [Trade on Aerodrome](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})
@@ -21,4 +22,4 @@ export async function sendAlert({ tokenAddress, tokenName, tokenSymbol, buyerAdd
     parse_mode: 'Markdown',
     disable_web_page_preview: true,
   });
-} 
+}

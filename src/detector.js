@@ -9,6 +9,29 @@ export const client = createPublicClient({
   transport: webSocket(process.env.BASE_WSS_RPC),
 });
 
+async function getEthPrice() {
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT');
+    const data = await res.json();
+    return parseFloat(data.price);
+  } catch {
+    return 2500; // fallback price
+  }
+}
+
+async function getTokenSupply(address) {
+  try {
+    const supply = await client.readContract({
+      address,
+      abi: [{ name: 'totalSupply', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] }],
+      functionName: 'totalSupply',
+    });
+    return supply;
+  } catch {
+    return 0n;
+  }
+}
+
 export function watchToken(tokenAddress, deployBlock, name, symbol) {
   if (watchedTokens.has(tokenAddress.toLowerCase())) return;
 
@@ -37,30 +60,5 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
 
         console.log(`🎯 First buy found for ${tokenAddress}`);
 
-        const amountIn = formatEther(log.args.amount1In > 0n ? log.args.amount1In : log.args.amount0In);
-
-        await sendAlert({
-          tokenAddress,
-          tokenName: state.name || 'Unknown',
-          tokenSymbol: state.symbol || '???',
-          buyerAddress: log.args.to,
-          amountIn,
-          txHash: log.transactionHash,
-        });
-
-        state.unwatch?.();
-        watchedTokens.delete(tokenAddress.toLowerCase());
-      }
-    },
-  });
-
-  watchedTokens.get(tokenAddress.toLowerCase()).unwatch = unwatch;
-
-  setTimeout(() => {
-    if (watchedTokens.has(tokenAddress.toLowerCase())) {
-      watchedTokens.get(tokenAddress.toLowerCase()).unwatch?.();
-      watchedTokens.delete(tokenAddress.toLowerCase());
-      console.log(`🗑️ Removed stale token watch: ${tokenAddress}`);
-    }
-  }, 30 * 60 * 1000);
-} 
+        const ethPrice = await getEthPrice();
+        const ethAmount
