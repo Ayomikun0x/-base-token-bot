@@ -5,19 +5,20 @@ dotenv.config();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const sentAlerts = new Set();
 
-export async function sendAlert({ tokenAddress, tokenName, tokenSymbol, buyerAddress, ethAmount, usdAmount, mcap, txHash }) {
-  
-  // Prevent duplicate alerts for same transaction
-  if (sentAlerts.has(txHash)) return;
-  sentAlerts.add(txHash);
+export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, walletAddress, ethAmount, usdAmount, mcap, txHash }) {
+
+  if (sentAlerts.has(txHash + type)) return;
+  sentAlerts.add(txHash + type);
+
+  const isLP = type === 'LP';
 
   const msg = `
-🟢 *First Buy Detected on Base!*
+${isLP ? '🟡 *Liquidity Added on Base!*' : '🟢 *First Buy Detected on Base!*'}
 
 🪙 Token: \`${tokenName}\` (${tokenSymbol})
 📍 Contract: \`${tokenAddress}\`
-👤 Buyer: \`${buyerAddress}\`
-💰 Buy Amount: ${ethAmount} ETH ($${usdAmount})
+${isLP ? '💧 LP Creator:' : '👤 Buyer:'} \`${walletAddress}\`
+💰 ${isLP ? 'ETH Added:' : 'Buy Amount:'} ${ethAmount} ETH ($${usdAmount})
 📊 Market Cap: ${mcap}
 
 🔗 [View on Basescan](https://basescan.org/tx/${txHash})
