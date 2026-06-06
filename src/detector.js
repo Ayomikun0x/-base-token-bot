@@ -12,8 +12,11 @@ const DEX_ADDRESSES = [
   '0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43', // Aerodrome Router
   '0x498581ff718922c3f8e6a244956af099b2652b2b', // Uniswap V4 Pool Manager
   '0x7c5f5a4bbd8fd63184577525326123b519429bdc', // Uniswap V4 Position Manager
-  '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24', // Uniswap V2 Router
+  '0x6ff5693b99212da76ad316178a184ab56d299b43', // Uniswap V4 Universal Router
 ].map(a => a.toLowerCase());
+
+const WETH = '0x4200000000000000000000000000000000000006';
+const MIN_ETH_BUY = 0.001; // minimum ETH for a real buy
 
 export const client = createPublicClient({
   chain: base,
@@ -46,6 +49,27 @@ async function getTokenSupply(address) {
     });
     return supply;
   } catch (e) { return 0n; }
+}
+
+async function getWethAmountFromTx(txHash) {
+  // Get WETH transfer amount from transaction logs
+  try {
+    const receipt = await client.getTransactionReceipt({ hash: txHash });
+    const wethTransferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+    for (const log of receipt.logs) {
+      if (
+        log.address.toLowerCase() === WETH.toLowerCase() &&
+        log.topics[0] === wethTransferTopic
+      ) {
+        const amount = BigInt(log.data);
+        return parseFloat(formatEther(amount));
+      }
+    }
+    return 0;
+  } catch (e) {
+    return 0;
+  }
 }
 
 function isDexAddress(address) {
@@ -92,14 +116,19 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
 
         try {
           const ethPrice = await getEthPrice();
+
+          // Get ETH amount from tx.value first, then fallback to WETH transfer
           const tx = await client.getTransaction({ hash: log.transactionHash });
-          const ethAmt = parseFloat(formatEther(tx.value || 0n));
+          let ethAmt = parseFloat(formatEther(tx.value || 0n));
+          if (ethAmt < MIN_ETH_BUY) {
+            ethAmt = await getWethAmountFromTx(log.transactionHash);
+          }
 
           const totalSupplyRaw = await getTokenSupply(tokenAddress);
           const totalSupply = parseFloat(formatEther(totalSupplyRaw));
           const tokensTransferred = parseFloat(formatEther(log.args.value));
 
-          // LP creation — tokens going TO a DEX address
+          // LP creation
           if (!state.lpAlerted && (isDexAddress(to) || log.blockNumber <= deployBlock + 3n)) {
             state.lpAlerted = true;
             state.lpTokensInPool = tokensTransferred;
@@ -122,11 +151,15 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             continue;
           }
 
-          // First buy — tokens going to a regular wallet
+          // First buy — skip if ETH amount too small
           if (!state.buyAlerted && !isDexAddress(to) && log.blockNumber > deployBlock + 3n) {
+            if (ethAmt < MIN_ETH_BUY) {
+              console.log('Skipping tiny buy: ' + ethAmt + ' ETH');
+              continue;
+            }
+
             state.buyAlerted = true;
 
-            // Use LP pool data for more accurate mcap if available
             const poolEth = state.lpEthAmount > 0 ? state.lpEthAmount : ethAmt;
             const poolTokens = state.lpTokensInPool > 0 ? state.lpTokensInPool : tokensTransferred;
             const mcap = calcMcap(poolEth, ethPrice, poolTokens, totalSupply);
