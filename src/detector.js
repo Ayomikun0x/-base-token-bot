@@ -4,13 +4,15 @@ import { sendAlert } from './telegram.js';
 
 const watchedTokens = new Map();
 
-// Known DEX routers and factories on Base
 const DEX_ADDRESSES = [
   '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24', // Uniswap V2 Router
   '0x8909dc15e40173ff4699343b6eb8132c65e18ec6', // Uniswap V2 Factory
   '0x2626664c2603336e57b271c5c0b26f421741e481', // Uniswap V3 Router
   '0x6131b5fae19ea4f9d964eac0408e4408b66337b5', // KyberSwap Router
   '0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43', // Aerodrome Router
+  '0x498581ff718922c3f8e6a244956af099b2652b2b', // Uniswap V4 Pool Manager
+  '0x7c5f5a4bbd8fd63184577525326123b519429bdc', // Uniswap V4 Position Manager
+  '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24', // Uniswap V2 Router
 ].map(a => a.toLowerCase());
 
 export const client = createPublicClient({
@@ -19,26 +21,20 @@ export const client = createPublicClient({
 });
 
 async function getEthPrice() {
-  // Try multiple price sources
   const sources = [
-    'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT',
-    'https://api.coinbase.com/v2/prices/ETH-USD/spot',
-    'https://min-api.cryptocompare.com/data/price?fsym=ETH&tsyms=USD',
+    { url: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', parse: d => parseFloat(d.price) },
+    { url: 'https://api.coinbase.com/v2/prices/ETH-USD/spot', parse: d => parseFloat(d.data?.amount) },
+    { url: 'https://min-api.cryptocompare.com/data/price?fsym=ETH&tsyms=USD', parse: d => parseFloat(d.USD) },
   ];
-
-  for (const url of sources) {
+  for (const s of sources) {
     try {
-      const res = await fetch(url);
+      const res = await fetch(s.url);
       const data = await res.json();
-      // Handle different response formats
-      if (data.price) return parseFloat(data.price); // Binance
-      if (data.data?.amount) return parseFloat(data.data.amount); // Coinbase
-      if (data.USD) return parseFloat(data.USD); // CryptoCompare
-    } catch (e) {
-      continue;
-    }
+      const price = s.parse(data);
+      if (price && !isNaN(price)) return price;
+    } catch (e) { continue; }
   }
-  return 2500; // fallback
+  return 2500;
 }
 
 async function getTokenSupply(address) {
@@ -49,13 +45,19 @@ async function getTokenSupply(address) {
       functionName: 'totalSupply',
     });
     return supply;
-  } catch (e) {
-    return 0n;
-  }
+  } catch (e) { return 0n; }
 }
 
 function isDexAddress(address) {
   return DEX_ADDRESSES.includes(address?.toLowerCase());
+}
+
+function calcMcap(ethAmt, ethPrice, tokensInPool, totalSupply) {
+  if (tokensInPool <= 0 || ethAmt <= 0) return 'N/A';
+  const pricePerToken = (ethAmt * ethPrice) / tokensInPool;
+  const mcap = pricePerToken * totalSupply;
+  if (isNaN(mcap) || mcap <= 0) return 'N/A';
+  return '$' + Math.round(mcap).toLocaleString();
 }
 
 export function watchToken(tokenAddress, deployBlock, name, symbol) {
@@ -67,6 +69,8 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
     symbol,
     lpAlerted: false,
     buyAlerted: false,
+    lpTokensInPool: 0,
+    lpEthAmount: 0,
     unwatch: null,
   });
 
@@ -80,7 +84,6 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
         const state = watchedTokens.get(tokenAddress.toLowerCase());
         if (!state) return;
         if (state.lpAlerted && state.buyAlerted) return;
-
         if (!log.args.value || log.args.value === 0n) continue;
 
         const from = log.args.from?.toLowerCase();
@@ -91,19 +94,20 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
           const ethPrice = await getEthPrice();
           const tx = await client.getTransaction({ hash: log.transactionHash });
           const ethAmt = parseFloat(formatEther(tx.value || 0n));
-          const usdAmount = (ethAmt * ethPrice).toFixed(2);
 
-          const totalSupply = await getTokenSupply(tokenAddress);
-          const supplyNum = parseFloat(formatEther(totalSupply));
-          const tokensBought = parseFloat(formatEther(log.args.value));
-          const tokenPriceUsd = tokensBought > 0 && ethAmt > 0 ? (ethAmt * ethPrice) / tokensBought : 0;
-          const mcap = supplyNum > 0 && tokenPriceUsd > 0
-            ? '$' + Math.round(supplyNum * tokenPriceUsd).toLocaleString()
-            : 'N/A';
+          const totalSupplyRaw = await getTokenSupply(tokenAddress);
+          const totalSupply = parseFloat(formatEther(totalSupplyRaw));
+          const tokensTransferred = parseFloat(formatEther(log.args.value));
 
-          // LP creation — tokens going TO a DEX pair/router
+          // LP creation — tokens going TO a DEX address
           if (!state.lpAlerted && (isDexAddress(to) || log.blockNumber <= deployBlock + 3n)) {
             state.lpAlerted = true;
+            state.lpTokensInPool = tokensTransferred;
+            state.lpEthAmount = ethAmt;
+
+            const mcap = calcMcap(ethAmt, ethPrice, tokensTransferred, totalSupply);
+            const usdAmount = (ethAmt * ethPrice).toFixed(2);
+
             await sendAlert({
               type: 'LP',
               tokenAddress,
@@ -121,6 +125,13 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
           // First buy — tokens going to a regular wallet
           if (!state.buyAlerted && !isDexAddress(to) && log.blockNumber > deployBlock + 3n) {
             state.buyAlerted = true;
+
+            // Use LP pool data for more accurate mcap if available
+            const poolEth = state.lpEthAmount > 0 ? state.lpEthAmount : ethAmt;
+            const poolTokens = state.lpTokensInPool > 0 ? state.lpTokensInPool : tokensTransferred;
+            const mcap = calcMcap(poolEth, ethPrice, poolTokens, totalSupply);
+            const usdAmount = (ethAmt * ethPrice).toFixed(2);
+
             await sendAlert({
               type: 'BUY',
               tokenAddress,
@@ -138,7 +149,6 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
           console.log('Error: ' + err.message);
         }
 
-        // Stop watching once both LP and buy are detected
         const updatedState = watchedTokens.get(tokenAddress.toLowerCase());
         if (updatedState?.lpAlerted && updatedState?.buyAlerted) {
           updatedState.unwatch?.();
