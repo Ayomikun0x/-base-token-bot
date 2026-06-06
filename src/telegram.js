@@ -3,8 +3,14 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const sentAlerts = new Set();
 
 export async function sendAlert({ tokenAddress, tokenName, tokenSymbol, buyerAddress, ethAmount, usdAmount, mcap, txHash }) {
+  
+  // Prevent duplicate alerts for same transaction
+  if (sentAlerts.has(txHash)) return;
+  sentAlerts.add(txHash);
+
   const msg = `
 🟢 *First Buy Detected on Base!*
 
@@ -12,7 +18,7 @@ export async function sendAlert({ tokenAddress, tokenName, tokenSymbol, buyerAdd
 📍 Contract: \`${tokenAddress}\`
 👤 Buyer: \`${buyerAddress}\`
 💰 Buy Amount: ${ethAmount} ETH ($${usdAmount})
-📊 Market Cap: $${Number(mcap).toLocaleString()}
+📊 Market Cap: ${mcap}
 
 🔗 [View on Basescan](https://basescan.org/tx/${txHash})
 🦅 [Trade on Aerodrome](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})
