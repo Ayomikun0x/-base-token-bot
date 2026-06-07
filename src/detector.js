@@ -64,20 +64,25 @@ async function getTokenSupply(address) {
 
 async function getHolderCount(tokenAddress) {
   try {
-    const alchemyKey = process.env.BASE_WSS_RPC.split('/').pop();
-    const url = `https://base-mainnet.g.alchemy.com/v2/${alchemyKey}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'alchemy_getTokenMetadata',
-        params: [tokenAddress],
-        id: 1,
-      }),
-    });
+    const apiKey = process.env.BASESCAN_API_KEY;
+    const url = `https://api.etherscan.io/v2/api?chainid=8453&module=token&action=tokenholderlist&contractaddress=${tokenAddress}&page=1&offset=1&apikey=${apiKey}`;
+    const res = await fetch(url);
     const data = await res.json();
-    return data?.result?.decimals ? '—' : '—';
+    if (data.status === '1' && data.result) {
+      // Get total holders via tokeninfo
+      const infoUrl = `https://api.etherscan.io/v2/api?chainid=8453&module=stats&action=tokensupply&contractaddress=${tokenAddress}&apikey=${apiKey}`;
+      const infoRes = await fetch(infoUrl);
+      const infoData = await infoRes.json();
+      // Use transfer count as proxy for holders
+      const transferUrl = `https://api.etherscan.io/v2/api?chainid=8453&module=account&action=tokentx&contractaddress=${tokenAddress}&page=1&offset=100&sort=asc&apikey=${apiKey}`;
+      const transferRes = await fetch(transferUrl);
+      const transferData = await transferRes.json();
+      if (transferData.status === '1' && transferData.result) {
+        const uniqueAddresses = new Set(transferData.result.map(tx => tx.to.toLowerCase()));
+        return uniqueAddresses.size.toString();
+      }
+    }
+    return '—';
   } catch (e) { return '—'; }
 }
 
@@ -86,11 +91,9 @@ async function getEthAmountFromTx(txHash) {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
     const tx = await client.getTransaction({ hash: txHash });
 
-    // First try tx.value (direct ETH send)
     let ethAmt = parseFloat(formatEther(tx.value || 0n));
     if (ethAmt >= 0.001) return ethAmt;
 
-    // Then try WETH transfer in logs
     const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
     let maxWeth = 0;
     for (const log of receipt.logs) {
@@ -155,17 +158,6 @@ async function findPoolAddress(txHash) {
   } catch (e) { return null; }
 }
 
-async function getPoolReserves(poolAddress) {
-  try {
-    const reserves = await client.readContract({
-      address: poolAddress,
-      abi: [{ name: 'getReserves', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint112', name: 'reserve0' }, { type: 'uint112', name: 'reserve1' }, { type: 'uint32', name: 'blockTimestampLast' }] }],
-      functionName: 'getReserves',
-    });
-    return reserves;
-  } catch (e) { return null; }
-}
-
 function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress, initialEthReserve) {
   if (!poolAddress || watchedPools.has(poolAddress.toLowerCase())) return;
 
@@ -176,14 +168,12 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress, init
     event: parseAbiItem('event Burn(address indexed sender, uint amount0, uint amount1, address indexed to)'),
     onLogs: async (logs) => {
       for (const log of logs) {
-        // Check how much ETH is being removed
         const amount0 = parseFloat(formatEther(BigInt(log.args.amount0 || 0)));
         const amount1 = parseFloat(formatEther(BigInt(log.args.amount1 || 0)));
         const ethRemoved = Math.max(amount0, amount1);
 
-        // Only alert if more than 10% of initial liquidity is removed
         if (initialEthReserve > 0 && ethRemoved < initialEthReserve * 0.1) {
-          console.log('Small burn detected — likely fee, skipping');
+          console.log('Small burn — likely fee, skipping');
           continue;
         }
 

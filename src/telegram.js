@@ -5,10 +5,6 @@ dotenv.config();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const sentAlerts = new Set();
 
-function pad(label, value) {
-  return `${label.padEnd(12)} ${value}`;
-}
-
 export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, walletAddress, ethAmount, usdAmount, mcap, lpStatus, holders, txHash }) {
 
   if (sentAlerts.has(txHash + type)) return;
@@ -19,21 +15,21 @@ export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, wa
   const walletLabel = isLP ? '💧 LP Creator' : '👤 Buyer';
   const amountLabel = isLP ? '💰 ETH Added' : '💰 Buy Amount';
 
-  const msg = `
-${header}
-
-\`\`\`
-${pad('Token:', tokenName + ' (' + tokenSymbol + ')')}
-${pad('Contract:', tokenAddress)}
-${pad(walletLabel + ':', walletAddress)}
-${pad(amountLabel + ':', ethAmount + ' ETH ($' + usdAmount + ')')}
-${pad('Market Cap:', mcap)}
-${pad('Holders:', holders)}
-${pad('LP Status:', lpStatus)}
-\`\`\`
-
-🔗 [Basescan](https://basescan.org/tx/${txHash}) | 🦅 [Trade](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})
-  `.trim();
+  const msg = [
+    header,
+    '',
+    `🪙 *Token:* ${tokenName} (${tokenSymbol})`,
+    `📍 *Contract:*`,
+    `\`${tokenAddress}\``,
+    `${walletLabel}:`,
+    `\`${walletAddress}\``,
+    `${amountLabel}: ${ethAmount} ETH ($${usdAmount})`,
+    `📊 *Market Cap:* ${mcap}`,
+    `👥 *Holders:* ${holders}`,
+    `🔒 *LP Status:* ${lpStatus}`,
+    '',
+    `🔗 [Basescan](https://basescan.org/tx/${txHash}) | 🦅 [Trade](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})`,
+  ].join('\n');
 
   await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {
     parse_mode: 'Markdown',
@@ -50,33 +46,31 @@ export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHas
   let msg = '';
 
   if (stage === 'removing') {
-    msg = `
-🔴 *LIQUIDITY BEING REMOVED!*
-
-\`\`\`
-${pad('Token:', tokenName + ' (' + tokenSymbol + ')')}
-${pad('Contract:', tokenAddress)}
-${pad('ETH Removed:', ethRemoved + ' ETH')}
-${pad('Status:', 'SELL IMMEDIATELY!')}
-\`\`\`
-
-🦅 [SELL NOW](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH) | 🔗 [Basescan](https://basescan.org/tx/${txHash})
-    `.trim();
+    msg = [
+      '🔴 *LIQUIDITY BEING REMOVED!*',
+      '',
+      `🪙 *Token:* ${tokenName} (${tokenSymbol})`,
+      `📍 *Contract:*`,
+      `\`${tokenAddress}\``,
+      `💸 *ETH Removed:* ${ethRemoved} ETH`,
+      `⚠️ *SELL IMMEDIATELY!*`,
+      '',
+      `🦅 [SELL NOW](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH) | 🔗 [Basescan](https://basescan.org/tx/${txHash})`,
+    ].join('\n');
   }
 
   if (stage === 'removed') {
-    msg = `
-🟤 *LIQUIDITY FULLY REMOVED!*
-
-\`\`\`
-${pad('Token:', tokenName + ' (' + tokenSymbol + ')')}
-${pad('Contract:', tokenAddress)}
-${pad('ETH Removed:', ethRemoved + ' ETH')}
-${pad('Status:', 'Token is dead 💀')}
-\`\`\`
-
-🔗 [View on Basescan](https://basescan.org/tx/${txHash})
-    `.trim();
+    msg = [
+      '🟤 *LIQUIDITY FULLY REMOVED!*',
+      '',
+      `🪙 *Token:* ${tokenName} (${tokenSymbol})`,
+      `📍 *Contract:*`,
+      `\`${tokenAddress}\``,
+      `💸 *ETH Removed:* ${ethRemoved} ETH`,
+      `💀 *Token is dead*`,
+      '',
+      `🔗 [View on Basescan](https://basescan.org/tx/${txHash})`,
+    ].join('\n');
   }
 
   if (!msg) return;
