@@ -28,6 +28,7 @@ const DEX_ADDRESSES = [
 ].map(a => a.toLowerCase());
 
 const WETH = '0x4200000000000000000000000000000000000006';
+const BASESCAN_API = 'https://api.etherscan.io/v2/api';
 
 export const client = createPublicClient({
   chain: base,
@@ -65,24 +66,14 @@ async function getTokenSupply(address) {
 async function getHolderCount(tokenAddress) {
   try {
     const apiKey = process.env.BASESCAN_API_KEY;
-    const url = `https://api.etherscan.io/v2/api?chainid=8453&module=token&action=tokenholderlist&contractaddress=${tokenAddress}&page=1&offset=1&apikey=${apiKey}`;
+    const url = `${BASESCAN_API}?chainid=8453&module=account&action=tokentx&contractaddress=${tokenAddress}&page=1&offset=100&sort=asc&apikey=${apiKey}`;
     const res = await fetch(url);
     const data = await res.json();
-    if (data.status === '1' && data.result) {
-      // Get total holders via tokeninfo
-      const infoUrl = `https://api.etherscan.io/v2/api?chainid=8453&module=stats&action=tokensupply&contractaddress=${tokenAddress}&apikey=${apiKey}`;
-      const infoRes = await fetch(infoUrl);
-      const infoData = await infoRes.json();
-      // Use transfer count as proxy for holders
-      const transferUrl = `https://api.etherscan.io/v2/api?chainid=8453&module=account&action=tokentx&contractaddress=${tokenAddress}&page=1&offset=100&sort=asc&apikey=${apiKey}`;
-      const transferRes = await fetch(transferUrl);
-      const transferData = await transferRes.json();
-      if (transferData.status === '1' && transferData.result) {
-        const uniqueAddresses = new Set(transferData.result.map(tx => tx.to.toLowerCase()));
-        return uniqueAddresses.size.toString();
-      }
+    if (data.status === '1' && data.result?.length > 0) {
+      const uniqueAddresses = new Set(data.result.map(tx => tx.to.toLowerCase()));
+      return uniqueAddresses.size.toString();
     }
-    return '—';
+    return '1';
   } catch (e) { return '—'; }
 }
 
@@ -91,9 +82,11 @@ async function getEthAmountFromTx(txHash) {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
     const tx = await client.getTransaction({ hash: txHash });
 
+    // Try tx.value first
     let ethAmt = parseFloat(formatEther(tx.value || 0n));
     if (ethAmt >= 0.001) return ethAmt;
 
+    // Try WETH transfers in logs — get the LARGEST one (that's the LP amount)
     const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
     let maxWeth = 0;
     for (const log of receipt.logs) {
@@ -102,7 +95,25 @@ async function getEthAmountFromTx(txHash) {
         if (amt > maxWeth) maxWeth = amt;
       }
     }
-    return maxWeth;
+    if (maxWeth >= 0.001) return maxWeth;
+
+    // Try internal transactions via Basescan API
+    try {
+      const apiKey = process.env.BASESCAN_API_KEY;
+      const url = `${BASESCAN_API}?chainid=8453&module=account&action=txlistinternal&txhash=${txHash}&apikey=${apiKey}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.status === '1' && data.result?.length > 0) {
+        let maxInternal = 0;
+        for (const itx of data.result) {
+          const val = parseFloat(formatEther(BigInt(itx.value || '0')));
+          if (val > maxInternal) maxInternal = val;
+        }
+        if (maxInternal >= 0.001) return maxInternal;
+      }
+    } catch (e) { }
+
+    return 0;
   } catch (e) { return 0; }
 }
 
