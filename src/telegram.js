@@ -28,7 +28,7 @@ export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, wa
     `👥 *Holders:* ${holders}`,
     `🔒 *LP Status:* ${lpStatus}`,
     '',
-    `🔗 [Basescan](https://basescan.org/tx/${txHash}) | 🦅 [Trade](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})`,
+    `🔗 [Basescan](https://basescan.org/tx/${txHash}) | 📈 [GMGN](https://gmgn.ai/base/token/${tokenAddress})`,
   ].join('\n');
 
   await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {
@@ -55,7 +55,7 @@ export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHas
       `💸 *ETH Removed:* ${ethRemoved} ETH`,
       `⚠️ *SELL IMMEDIATELY!*`,
       '',
-      `🦅 [SELL NOW](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH) | 🔗 [Basescan](https://basescan.org/tx/${txHash})`,
+      `📈 [SELL on GMGN](https://gmgn.ai/base/token/${tokenAddress}) | 🔗 [Basescan](https://basescan.org/tx/${txHash})`,
     ].join('\n');
   }
 

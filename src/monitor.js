@@ -4,7 +4,6 @@ import { client, watchToken } from './detector.js';
 const ERC20_ABI = [
   { name: 'name', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { name: 'symbol', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
-  { name: 'totalSupply', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
 ];
 
 const MIN_LP_ETH = 0.1;
@@ -48,6 +47,46 @@ async function checkMintFunction(address) {
   }
 }
 
+async function getMaxEthInBlock(blockNumber) {
+  try {
+    const blockData = await client.getBlock({ blockNumber, includeTransactions: true });
+    const WETH = '0x4200000000000000000000000000000000000006';
+    const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+    // Check tx.value first
+    let maxEth = 0;
+    for (const tx of blockData.transactions) {
+      if (tx.value > 0n) {
+        const val = parseFloat(formatEther(tx.value));
+        if (val > maxEth) maxEth = val;
+      }
+    }
+    if (maxEth >= MIN_LP_ETH) return maxEth;
+
+    // Check WETH transfers in block receipts
+    try {
+      const receipts = await Promise.all(
+        blockData.transactions.slice(0, 20).map(tx =>
+          client.getTransactionReceipt({ hash: tx.hash }).catch(() => null)
+        )
+      );
+      for (const receipt of receipts) {
+        if (!receipt) continue;
+        for (const log of receipt.logs) {
+          if (log.address.toLowerCase() === WETH.toLowerCase() && log.topics[0] === transferTopic) {
+            const amt = parseFloat(formatEther(BigInt(log.data)));
+            if (amt > maxEth) maxEth = amt;
+          }
+        }
+      }
+    } catch (e) { }
+
+    return maxEth;
+  } catch (e) {
+    return 0;
+  }
+}
+
 async function runFilters(contractAddress, block) {
   console.log('Running filters for: ' + contractAddress);
 
@@ -74,30 +113,18 @@ async function runFilters(contractAddress, block) {
   }
 
   // 3. Check LP ETH in deploy block
-  try {
-    const blockData = await client.getBlock({ blockNumber: block.number, includeTransactions: true });
-    let maxEthInBlock = 0;
-    for (const tx of blockData.transactions) {
-      if (tx.value > 0n) {
-        const ethVal = parseFloat(formatEther(tx.value));
-        if (ethVal > maxEthInBlock) maxEthInBlock = ethVal;
-      }
-    }
+  const maxEth = await getMaxEthInBlock(block.number);
 
-    if (maxEthInBlock < MIN_LP_ETH) {
-      console.log('❌ Filtered: LP ETH too low (' + maxEthInBlock.toFixed(3) + ' ETH) - ' + contractAddress);
-      return false;
-    }
+  if (maxEth < MIN_LP_ETH) {
+    console.log('❌ Filtered: LP ETH too low (' + maxEth.toFixed(3) + ' ETH) - ' + contractAddress);
+    return false;
+  }
 
-    // 4. Check rough Mcap
-    const roughMcap = maxEthInBlock * ethPrice * 2;
-    if (roughMcap < MIN_MCAP_USD) {
-      console.log('❌ Filtered: Mcap too low ($' + Math.round(roughMcap) + ') - ' + contractAddress);
-      return false;
-    }
-
-  } catch (e) {
-    console.log('Filter check error: ' + e.message);
+  // 4. Check rough Mcap
+  const roughMcap = maxEth * ethPrice * 2;
+  if (roughMcap < MIN_MCAP_USD) {
+    console.log('❌ Filtered: Mcap too low ($' + Math.round(roughMcap) + ') - ' + contractAddress);
+    return false;
   }
 
   console.log('✅ Passed filters: ' + contractAddress);

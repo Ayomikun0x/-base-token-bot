@@ -86,7 +86,7 @@ async function getEthAmountFromTx(txHash) {
     let ethAmt = parseFloat(formatEther(tx.value || 0n));
     if (ethAmt >= 0.001) return ethAmt;
 
-    // Try WETH transfers in logs — get the LARGEST one (that's the LP amount)
+    // Try WETH transfers — get largest one
     const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
     let maxWeth = 0;
     for (const log of receipt.logs) {
@@ -97,7 +97,7 @@ async function getEthAmountFromTx(txHash) {
     }
     if (maxWeth >= 0.001) return maxWeth;
 
-    // Try internal transactions via Basescan API
+    // Try Basescan internal transactions
     try {
       const apiKey = process.env.BASESCAN_API_KEY;
       const url = `${BASESCAN_API}?chainid=8453&module=account&action=txlistinternal&txhash=${txHash}&apikey=${apiKey}`;
@@ -156,74 +156,152 @@ function calcMcap(ethInPool, ethPrice, tokensInPool, totalSupply) {
   return '$' + Math.round(mcap).toLocaleString();
 }
 
-async function findPoolAddress(txHash) {
+async function findPoolAddress(tokenAddress, txHash) {
   try {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
+
+    // V2 PairCreated event
     const pairCreatedTopic = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
     for (const log of receipt.logs) {
       if (log.topics[0] === pairCreatedTopic) {
-        return '0x' + log.data.slice(26, 66);
+        const poolAddr = '0x' + log.data.slice(26, 66);
+        console.log('Found V2 pool: ' + poolAddr);
+        return { address: poolAddr, version: 'v2' };
       }
     }
+
+    // V2 pool — check Sync event (always fires on LP creation)
+    const syncTopic = '0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1';
+    for (const log of receipt.logs) {
+      if (log.topics[0] === syncTopic) {
+        console.log('Found V2 pool via Sync: ' + log.address);
+        return { address: log.address, version: 'v2' };
+      }
+    }
+
+    // V4 pool — use Pool Manager address
+    const v4InitTopic = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';
+    for (const log of receipt.logs) {
+      if (log.topics[0] === v4InitTopic) {
+        const poolId = log.topics[1];
+        console.log('Found V4 pool ID: ' + poolId);
+        return { address: '0x498581ff718922c3f8e6a244956af099b2652b2b', version: 'v4', poolId };
+      }
+    }
+
     return null;
-  } catch (e) { return null; }
+  } catch (e) {
+    return null;
+  }
 }
 
-function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress, initialEthReserve) {
-  if (!poolAddress || watchedPools.has(poolAddress.toLowerCase())) return;
+function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolInfo, initialEthReserve) {
+  if (!poolInfo) return;
 
-  console.log('👁️ Watching pool for rug: ' + poolAddress);
+  const poolKey = poolInfo.address.toLowerCase();
+  if (watchedPools.has(poolKey)) return;
 
-  const unwatch = client.watchEvent({
-    address: poolAddress,
-    event: parseAbiItem('event Burn(address indexed sender, uint amount0, uint amount1, address indexed to)'),
-    onLogs: async (logs) => {
-      for (const log of logs) {
-        const amount0 = parseFloat(formatEther(BigInt(log.args.amount0 || 0)));
-        const amount1 = parseFloat(formatEther(BigInt(log.args.amount1 || 0)));
-        const ethRemoved = Math.max(amount0, amount1);
+  console.log('👁️ Watching pool for rug: ' + poolInfo.address + ' (version: ' + poolInfo.version + ')');
 
-        if (initialEthReserve > 0 && ethRemoved < initialEthReserve * 0.1) {
-          console.log('Small burn — likely fee, skipping');
-          continue;
-        }
+  let unwatch;
 
-        console.log('🔴 LIQUIDITY REMOVAL DETECTED for ' + tokenAddress);
+  if (poolInfo.version === 'v2') {
+    // V2 — watch Burn event directly on pool
+    unwatch = client.watchEvent({
+      address: poolInfo.address,
+      event: parseAbiItem('event Burn(address indexed sender, uint amount0, uint amount1, address indexed to)'),
+      onLogs: async (logs) => {
+        for (const log of logs) {
+          const amount0 = parseFloat(formatEther(BigInt(log.args.amount0 || 0)));
+          const amount1 = parseFloat(formatEther(BigInt(log.args.amount1 || 0)));
+          const ethRemoved = Math.max(amount0, amount1);
 
-        await sendRugAlert({
-          tokenAddress,
-          tokenName,
-          tokenSymbol,
-          txHash: log.transactionHash,
-          stage: 'removing',
-          ethRemoved: ethRemoved.toFixed(4),
-        });
+          // Only alert if significant liquidity removed (>5% of initial)
+          if (initialEthReserve > 0 && ethRemoved < initialEthReserve * 0.05) {
+            console.log('Small burn — likely fee, skipping (' + ethRemoved + ' ETH)');
+            continue;
+          }
 
-        setTimeout(async () => {
+          console.log('🔴 V2 LIQUIDITY REMOVAL for ' + tokenAddress);
+
           await sendRugAlert({
             tokenAddress,
             tokenName,
             tokenSymbol,
             txHash: log.transactionHash,
-            stage: 'removed',
+            stage: 'removing',
             ethRemoved: ethRemoved.toFixed(4),
           });
-        }, 30000);
 
-        watchedPools.get(poolAddress.toLowerCase())?.();
-        watchedPools.delete(poolAddress.toLowerCase());
+          setTimeout(async () => {
+            await sendRugAlert({
+              tokenAddress,
+              tokenName,
+              tokenSymbol,
+              txHash: log.transactionHash,
+              stage: 'removed',
+              ethRemoved: ethRemoved.toFixed(4),
+            });
+          }, 30000);
+
+          watchedPools.get(poolKey)?.();
+          watchedPools.delete(poolKey);
+        }
+      },
+    });
+  } else if (poolInfo.version === 'v4') {
+    // V4 — watch ModifyLiquidity with negative delta on Pool Manager
+    unwatch = client.watchEvent({
+      address: poolInfo.address,
+      event: parseAbiItem('event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)'),
+      onLogs: async (logs) => {
+        for (const log of logs) {
+          // Only process events for our pool ID
+          if (poolInfo.poolId && log.topics[1] !== poolInfo.poolId) continue;
+
+          const delta = BigInt(log.args.liquidityDelta || 0);
+          if (delta >= 0n) continue; // Only negative = removal
+
+          console.log('🔴 V4 LIQUIDITY REMOVAL for ' + tokenAddress);
+
+          await sendRugAlert({
+            tokenAddress,
+            tokenName,
+            tokenSymbol,
+            txHash: log.transactionHash,
+            stage: 'removing',
+            ethRemoved: 'Unknown',
+          });
+
+          setTimeout(async () => {
+            await sendRugAlert({
+              tokenAddress,
+              tokenName,
+              tokenSymbol,
+              txHash: log.transactionHash,
+              stage: 'removed',
+              ethRemoved: 'Unknown',
+            });
+          }, 30000);
+
+          watchedPools.get(poolKey)?.();
+          watchedPools.delete(poolKey);
+        }
+      },
+    });
+  }
+
+  if (unwatch) {
+    watchedPools.set(poolKey, unwatch);
+
+    setTimeout(() => {
+      if (watchedPools.has(poolKey)) {
+        watchedPools.get(poolKey)?.();
+        watchedPools.delete(poolKey);
+        console.log('Pool watch expired: ' + poolInfo.address);
       }
-    },
-  });
-
-  watchedPools.set(poolAddress.toLowerCase(), unwatch);
-
-  setTimeout(() => {
-    if (watchedPools.has(poolAddress.toLowerCase())) {
-      watchedPools.get(poolAddress.toLowerCase())?.();
-      watchedPools.delete(poolAddress.toLowerCase());
-    }
-  }, 24 * 60 * 60 * 1000);
+    }, 24 * 60 * 60 * 1000);
+  }
 }
 
 export function watchToken(tokenAddress, deployBlock, name, symbol) {
@@ -237,7 +315,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
     buyAlerted: false,
     lpTokensInPool: 0,
     lpEthAmount: 0,
-    poolAddress: null,
+    poolInfo: null,
     deployerAddress: null,
     unwatch: null,
   });
@@ -273,8 +351,8 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             state.lpEthAmount = ethAmt;
             state.deployerAddress = from;
 
-            const poolAddr = await findPoolAddress(log.transactionHash);
-            state.poolAddress = poolAddr;
+            const poolInfo = await findPoolAddress(tokenAddress, log.transactionHash);
+            state.poolInfo = poolInfo;
 
             const mcap = calcMcap(ethAmt, ethPrice, tokensTransferred, totalSupply);
             const usdAmount = (ethAmt * ethPrice).toFixed(2);
@@ -295,8 +373,8 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
               txHash: log.transactionHash,
             });
 
-            if (poolAddr) {
-              watchPoolForRug(tokenAddress, state.name, state.symbol, poolAddr, ethAmt);
+            if (poolInfo) {
+              watchPoolForRug(tokenAddress, state.name, state.symbol, poolInfo, ethAmt);
             }
             continue;
           }
