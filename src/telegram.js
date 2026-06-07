@@ -32,22 +32,42 @@ ${isLP ? '💧 LP Creator:' : '👤 Buyer:'} \`${walletAddress}\`
   });
 }
 
-export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHash, ethPrice }) {
-  const key = txHash + 'RUG';
+export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHash, stage }) {
+
+  const key = txHash + 'RUG' + stage;
   if (sentAlerts.has(key)) return;
   sentAlerts.add(key);
 
-  const msg = `
-🔴 *LIQUIDITY REMOVAL DETECTED!*
+  let msg = '';
 
-⚠️ *POSSIBLE RUG PULL — SELL IMMEDIATELY!*
+  if (stage === 'removing') {
+    msg = `
+🔴 *LIQUIDITY BEING REMOVED!*
+
+⚠️ *SELL IMMEDIATELY BEFORE PRICE CRASHES!*
+
+🪙 Token: \`${tokenName}\` (${tokenSymbol})
+📍 Contract: \`${tokenAddress}\`
+
+🦅 [SELL NOW on Aerodrome](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH)
+🔗 [View on Basescan](https://basescan.org/tx/${txHash})
+    `.trim();
+  }
+
+  if (stage === 'removed') {
+    msg = `
+🟤 *LIQUIDITY FULLY REMOVED!*
+
+💀 *Token is effectively dead — price has likely crashed*
 
 🪙 Token: \`${tokenName}\` (${tokenSymbol})
 📍 Contract: \`${tokenAddress}\`
 
 🔗 [View on Basescan](https://basescan.org/tx/${txHash})
-🦅 [Sell on Aerodrome](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH)
-  `.trim();
+    `.trim();
+  }
+
+  if (!msg) return;
 
   await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {
     parse_mode: 'Markdown',
