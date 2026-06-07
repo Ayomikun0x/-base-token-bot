@@ -5,13 +5,10 @@ const ERC20_ABI = [
   { name: 'name', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { name: 'symbol', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
   { name: 'totalSupply', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] },
-  { name: 'owner', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] },
 ];
 
-// Minimum filters
-const MIN_LP_ETH = 0.5;
+const MIN_LP_ETH = 0.1;
 const MIN_MCAP_USD = 8000;
-const MAX_TAX_PERCENT = 5;
 
 async function getEthPrice() {
   try {
@@ -42,35 +39,11 @@ async function getTokenMeta(address) {
 }
 
 async function checkMintFunction(address) {
-  // Check if contract bytecode contains mint function signature
   try {
     const bytecode = await client.getBytecode({ address });
     if (!bytecode) return false;
-    // mint(address,uint256) selector = 0x40c10f19
-    // mint(uint256) selector = 0xa0712d68
     return bytecode.includes('40c10f19') || bytecode.includes('a0712d68');
   } catch {
-    return false;
-  }
-}
-
-async function checkHoneypot(tokenAddress, poolAddress) {
-  // Simple honeypot check — try to simulate a sell
-  // If transfer to pool fails it's likely a honeypot
-  try {
-    await client.readContract({
-      address: tokenAddress,
-      abi: [{ name: 'transfer', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }], outputs: [{ type: 'bool' }] }],
-      functionName: 'transfer',
-      args: [poolAddress, 1n],
-    });
-    return false; // not a honeypot
-  } catch (e) {
-    const msg = e.message?.toLowerCase() || '';
-    // If error mentions blacklist/whitelist/forbidden it's a honeypot
-    if (msg.includes('blacklist') || msg.includes('forbidden') || msg.includes('not allowed') || msg.includes('whitelist')) {
-      return true;
-    }
     return false;
   }
 }
@@ -87,7 +60,7 @@ async function runFilters(contractAddress, block) {
     return false;
   }
 
-  // 2. Get total supply and check LP from block receipts
+  // 2. Get total supply
   let totalSupply = 0n;
   try {
     totalSupply = await client.readContract({
@@ -100,7 +73,7 @@ async function runFilters(contractAddress, block) {
     return false;
   }
 
-  // 3. Check LP ETH — look at transaction value in deploy block
+  // 3. Check LP ETH in deploy block
   try {
     const blockData = await client.getBlock({ blockNumber: block.number, includeTransactions: true });
     let maxEthInBlock = 0;
@@ -116,11 +89,8 @@ async function runFilters(contractAddress, block) {
       return false;
     }
 
-    // 4. Check Mcap estimate
-    // Use max ETH in block as rough LP estimate
-    const supplyNum = parseFloat(formatEther(totalSupply));
-    // Rough token price = LP ETH / (half of supply going to pool estimate)
-    const roughMcap = maxEthInBlock * ethPrice * 2; // rough estimate
+    // 4. Check rough Mcap
+    const roughMcap = maxEthInBlock * ethPrice * 2;
     if (roughMcap < MIN_MCAP_USD) {
       console.log('❌ Filtered: Mcap too low ($' + Math.round(roughMcap) + ') - ' + contractAddress);
       return false;
@@ -158,11 +128,9 @@ export function startMonitor() {
           const { name, symbol } = await getTokenMeta(contractAddress);
           console.log('🆕 New ERC-20: ' + name + ' (' + symbol + ') at ' + contractAddress);
 
-          // Run all filters
           const passed = await runFilters(contractAddress, block);
           if (!passed) continue;
 
-          // Start watching for LP and first buy
           watchToken(contractAddress, block.number, name, symbol);
 
         } catch (err) {
