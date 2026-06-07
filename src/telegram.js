@@ -5,7 +5,7 @@ dotenv.config();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const sentAlerts = new Set();
 
-export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, walletAddress, ethAmount, usdAmount, mcap, txHash }) {
+export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, walletAddress, ethAmount, usdAmount, mcap, lpStatus, txHash }) {
 
   if (sentAlerts.has(txHash + type)) return;
   sentAlerts.add(txHash + type);
@@ -20,9 +20,33 @@ ${isLP ? '🟡 *Liquidity Added on Base!*' : '🟢 *First Buy Detected on Base!*
 ${isLP ? '💧 LP Creator:' : '👤 Buyer:'} \`${walletAddress}\`
 💰 ${isLP ? 'ETH Added:' : 'Buy Amount:'} ${ethAmount} ETH ($${usdAmount})
 📊 Market Cap: ${mcap}
+🔒 LP Status: ${lpStatus}
 
 🔗 [View on Basescan](https://basescan.org/tx/${txHash})
 🦅 [Trade on Aerodrome](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})
+  `.trim();
+
+  await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+  });
+}
+
+export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHash, ethPrice }) {
+  const key = txHash + 'RUG';
+  if (sentAlerts.has(key)) return;
+  sentAlerts.add(key);
+
+  const msg = `
+🔴 *LIQUIDITY REMOVAL DETECTED!*
+
+⚠️ *POSSIBLE RUG PULL — SELL IMMEDIATELY!*
+
+🪙 Token: \`${tokenName}\` (${tokenSymbol})
+📍 Contract: \`${tokenAddress}\`
+
+🔗 [View on Basescan](https://basescan.org/tx/${txHash})
+🦅 [Sell on Aerodrome](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH)
   `.trim();
 
   await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {

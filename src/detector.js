@@ -1,22 +1,18 @@
 import { createPublicClient, webSocket, parseAbiItem, formatEther } from 'viem';
 import { base } from 'viem/chains';
-import { sendAlert } from './telegram.js';
+import { sendAlert, sendRugAlert } from './telegram.js';
 
 const watchedTokens = new Map();
+const watchedPools = new Map();
 
-const DEX_ADDRESSES = [
-  '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24', // Uniswap V2 Router
-  '0x8909dc15e40173ff4699343b6eb8132c65e18ec6', // Uniswap V2 Factory
-  '0x2626664c2603336e57b271c5c0b26f421741e481', // Uniswap V3 Router
-  '0x6131b5fae19ea4f9d964eac0408e4408b66337b5', // KyberSwap Router
-  '0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43', // Aerodrome Router
-  '0x498581ff718922c3f8e6a244956af099b2652b2b', // Uniswap V4 Pool Manager
-  '0x7c5f5a4bbd8fd63184577525326123b519429bdc', // Uniswap V4 Position Manager
-  '0x6ff5693b99212da76ad316178a184ab56d299b43', // Uniswap V4 Universal Router
+// Known LP lock contracts on Base
+const LP_LOCK_CONTRACTS = [
+  '0x231278ded31593e3ad0f895d279525144b58206d', // Unicrypt on Base
+  '0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe', // Pink Lock
+  '0xdae1a0fb2d8b1f664d7e3ee5ef8b70cfce7ac7ee', // Team Finance
 ].map(a => a.toLowerCase());
 
-const WETH = '0x4200000000000000000000000000000000000006';
-const MIN_ETH_BUY = 0.001; // minimum ETH for a real buy
+const DEAD_ADDRESS = '0x000000000000000000000000000000000000dead';
 
 export const client = createPublicClient({
   chain: base,
@@ -52,25 +48,49 @@ async function getTokenSupply(address) {
 }
 
 async function getWethAmountFromTx(txHash) {
-  // Get WETH transfer amount from transaction logs
   try {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
     const wethTransferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-
+    const WETH = '0x4200000000000000000000000000000000000006';
     for (const log of receipt.logs) {
-      if (
-        log.address.toLowerCase() === WETH.toLowerCase() &&
-        log.topics[0] === wethTransferTopic
-      ) {
-        const amount = BigInt(log.data);
-        return parseFloat(formatEther(amount));
+      if (log.address.toLowerCase() === WETH.toLowerCase() && log.topics[0] === wethTransferTopic) {
+        return parseFloat(formatEther(BigInt(log.data)));
       }
     }
     return 0;
+  } catch (e) { return 0; }
+}
+
+async function checkLpLocked(tokenAddress) {
+  // Check if LP tokens sent to lock contract or dead address
+  try {
+    const logs = await client.getLogs({
+      event: parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)'),
+      address: tokenAddress,
+      fromBlock: 'earliest',
+    });
+
+    for (const log of logs) {
+      const to = log.args.to?.toLowerCase();
+      if (to === DEAD_ADDRESS.toLowerCase()) return { locked: true, type: '🔥 LP Burned' };
+      if (LP_LOCK_CONTRACTS.includes(to)) return { locked: true, type: '🔒 LP Locked' };
+    }
+    return { locked: false, type: '⚠️ LP NOT LOCKED' };
   } catch (e) {
-    return 0;
+    return { locked: false, type: '⚠️ LP Status Unknown' };
   }
 }
+
+const DEX_ADDRESSES = [
+  '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24',
+  '0x8909dc15e40173ff4699343b6eb8132c65e18ec6',
+  '0x2626664c2603336e57b271c5c0b26f421741e481',
+  '0x6131b5fae19ea4f9d964eac0408e4408b66337b5',
+  '0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43',
+  '0x498581ff718922c3f8e6a244956af099b2652b2b',
+  '0x7c5f5a4bbd8fd63184577525326123b519429bdc',
+  '0x6ff5693b99212da76ad316178a184ab56d299b43',
+].map(a => a.toLowerCase());
 
 function isDexAddress(address) {
   return DEX_ADDRESSES.includes(address?.toLowerCase());
@@ -84,6 +104,56 @@ function calcMcap(ethAmt, ethPrice, tokensInPool, totalSupply) {
   return '$' + Math.round(mcap).toLocaleString();
 }
 
+function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress, lpEthAmount) {
+  if (watchedPools.has(poolAddress.toLowerCase())) return;
+
+  console.log('👁️ Watching pool for rug: ' + poolAddress);
+
+  // Watch for liquidity removal on Uniswap V4 Pool Manager
+  const POOL_MANAGER = '0x498581ff718922c3f8e6a244956af099b2652b2b';
+
+  const unwatch = client.watchEvent({
+    address: POOL_MANAGER,
+    event: parseAbiItem('event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)'),
+    onLogs: async (logs) => {
+      for (const log of logs) {
+        // Negative liquidityDelta = liquidity being REMOVED
+        const delta = BigInt(log.args.liquidityDelta || 0);
+        if (delta >= 0n) continue;
+
+        const ethPrice = await getEthPrice();
+        const removedPercent = lpEthAmount > 0
+          ? Math.abs(Number(delta)) / Math.abs(Number(delta)) * 100
+          : 0;
+
+        console.log('🔴 LIQUIDITY REMOVAL DETECTED for ' + tokenAddress);
+
+        await sendRugAlert({
+          tokenAddress,
+          tokenName,
+          tokenSymbol,
+          txHash: log.transactionHash,
+          ethPrice,
+        });
+
+        // Stop watching after rug detected
+        watchedPools.get(poolAddress.toLowerCase())?.();
+        watchedPools.delete(poolAddress.toLowerCase());
+      }
+    },
+  });
+
+  watchedPools.set(poolAddress.toLowerCase(), unwatch);
+
+  // Stop watching after 24 hours
+  setTimeout(() => {
+    if (watchedPools.has(poolAddress.toLowerCase())) {
+      watchedPools.get(poolAddress.toLowerCase())?.();
+      watchedPools.delete(poolAddress.toLowerCase());
+    }
+  }, 24 * 60 * 60 * 1000);
+}
+
 export function watchToken(tokenAddress, deployBlock, name, symbol) {
   if (watchedTokens.has(tokenAddress.toLowerCase())) return;
 
@@ -95,6 +165,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
     buyAlerted: false,
     lpTokensInPool: 0,
     lpEthAmount: 0,
+    poolAddress: null,
     unwatch: null,
   });
 
@@ -116,13 +187,9 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
 
         try {
           const ethPrice = await getEthPrice();
-
-          // Get ETH amount from tx.value first, then fallback to WETH transfer
           const tx = await client.getTransaction({ hash: log.transactionHash });
           let ethAmt = parseFloat(formatEther(tx.value || 0n));
-          if (ethAmt < MIN_ETH_BUY) {
-            ethAmt = await getWethAmountFromTx(log.transactionHash);
-          }
+          if (ethAmt < 0.001) ethAmt = await getWethAmountFromTx(log.transactionHash);
 
           const totalSupplyRaw = await getTokenSupply(tokenAddress);
           const totalSupply = parseFloat(formatEther(totalSupplyRaw));
@@ -133,9 +200,11 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             state.lpAlerted = true;
             state.lpTokensInPool = tokensTransferred;
             state.lpEthAmount = ethAmt;
+            state.poolAddress = to;
 
             const mcap = calcMcap(ethAmt, ethPrice, tokensTransferred, totalSupply);
             const usdAmount = (ethAmt * ethPrice).toFixed(2);
+            const lpStatus = await checkLpLocked(tokenAddress);
 
             await sendAlert({
               type: 'LP',
@@ -146,17 +215,18 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
               ethAmount: ethAmt.toFixed(4),
               usdAmount,
               mcap,
+              lpStatus: lpStatus.type,
               txHash: log.transactionHash,
             });
+
+            // Start watching pool for rug
+            watchPoolForRug(tokenAddress, state.name, state.symbol, to, ethAmt);
             continue;
           }
 
-          // First buy — skip if ETH amount too small
+          // First buy
           if (!state.buyAlerted && !isDexAddress(to) && log.blockNumber > deployBlock + 3n) {
-            if (ethAmt < MIN_ETH_BUY) {
-              console.log('Skipping tiny buy: ' + ethAmt + ' ETH');
-              continue;
-            }
+            if (ethAmt < 0.001) continue;
 
             state.buyAlerted = true;
 
@@ -164,6 +234,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             const poolTokens = state.lpTokensInPool > 0 ? state.lpTokensInPool : tokensTransferred;
             const mcap = calcMcap(poolEth, ethPrice, poolTokens, totalSupply);
             const usdAmount = (ethAmt * ethPrice).toFixed(2);
+            const lpStatus = await checkLpLocked(tokenAddress);
 
             await sendAlert({
               type: 'BUY',
@@ -174,6 +245,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
               ethAmount: ethAmt.toFixed(4),
               usdAmount,
               mcap,
+              lpStatus: lpStatus.type,
               txHash: log.transactionHash,
             });
           }
