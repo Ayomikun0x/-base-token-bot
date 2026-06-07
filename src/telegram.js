@@ -5,25 +5,34 @@ dotenv.config();
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const sentAlerts = new Set();
 
-export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, walletAddress, ethAmount, usdAmount, mcap, lpStatus, txHash }) {
+function pad(label, value) {
+  return `${label.padEnd(12)} ${value}`;
+}
+
+export async function sendAlert({ type, tokenAddress, tokenName, tokenSymbol, walletAddress, ethAmount, usdAmount, mcap, lpStatus, holders, txHash }) {
 
   if (sentAlerts.has(txHash + type)) return;
   sentAlerts.add(txHash + type);
 
   const isLP = type === 'LP';
+  const header = isLP ? '🟡 *Liquidity Added on Base!*' : '🟢 *First Buy Detected on Base!*';
+  const walletLabel = isLP ? '💧 LP Creator' : '👤 Buyer';
+  const amountLabel = isLP ? '💰 ETH Added' : '💰 Buy Amount';
 
   const msg = `
-${isLP ? '🟡 *Liquidity Added on Base!*' : '🟢 *First Buy Detected on Base!*'}
+${header}
 
-🪙 Token: \`${tokenName}\` (${tokenSymbol})
-📍 Contract: \`${tokenAddress}\`
-${isLP ? '💧 LP Creator:' : '👤 Buyer:'} \`${walletAddress}\`
-💰 ${isLP ? 'ETH Added:' : 'Buy Amount:'} ${ethAmount} ETH ($${usdAmount})
-📊 Market Cap: ${mcap}
-🔒 LP Status: ${lpStatus}
+\`\`\`
+${pad('Token:', tokenName + ' (' + tokenSymbol + ')')}
+${pad('Contract:', tokenAddress)}
+${pad(walletLabel + ':', walletAddress)}
+${pad(amountLabel + ':', ethAmount + ' ETH ($' + usdAmount + ')')}
+${pad('Market Cap:', mcap)}
+${pad('Holders:', holders)}
+${pad('LP Status:', lpStatus)}
+\`\`\`
 
-🔗 [View on Basescan](https://basescan.org/tx/${txHash})
-🦅 [Trade on Aerodrome](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})
+🔗 [Basescan](https://basescan.org/tx/${txHash}) | 🦅 [Trade](https://aerodrome.finance/swap?inputCurrency=ETH&outputCurrency=${tokenAddress})
   `.trim();
 
   await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {
@@ -32,7 +41,7 @@ ${isLP ? '💧 LP Creator:' : '👤 Buyer:'} \`${walletAddress}\`
   });
 }
 
-export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHash, stage }) {
+export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHash, stage, ethRemoved }) {
 
   const key = txHash + 'RUG' + stage;
   if (sentAlerts.has(key)) return;
@@ -44,13 +53,14 @@ export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHas
     msg = `
 🔴 *LIQUIDITY BEING REMOVED!*
 
-⚠️ *SELL IMMEDIATELY BEFORE PRICE CRASHES!*
+\`\`\`
+${pad('Token:', tokenName + ' (' + tokenSymbol + ')')}
+${pad('Contract:', tokenAddress)}
+${pad('ETH Removed:', ethRemoved + ' ETH')}
+${pad('Status:', 'SELL IMMEDIATELY!')}
+\`\`\`
 
-🪙 Token: \`${tokenName}\` (${tokenSymbol})
-📍 Contract: \`${tokenAddress}\`
-
-🦅 [SELL NOW on Aerodrome](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH)
-🔗 [View on Basescan](https://basescan.org/tx/${txHash})
+🦅 [SELL NOW](https://aerodrome.finance/swap?inputCurrency=${tokenAddress}&outputCurrency=ETH) | 🔗 [Basescan](https://basescan.org/tx/${txHash})
     `.trim();
   }
 
@@ -58,10 +68,12 @@ export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHas
     msg = `
 🟤 *LIQUIDITY FULLY REMOVED!*
 
-💀 *Token is effectively dead — price has likely crashed*
-
-🪙 Token: \`${tokenName}\` (${tokenSymbol})
-📍 Contract: \`${tokenAddress}\`
+\`\`\`
+${pad('Token:', tokenName + ' (' + tokenSymbol + ')')}
+${pad('Contract:', tokenAddress)}
+${pad('ETH Removed:', ethRemoved + ' ETH')}
+${pad('Status:', 'Token is dead 💀')}
+\`\`\`
 
 🔗 [View on Basescan](https://basescan.org/tx/${txHash})
     `.trim();

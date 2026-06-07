@@ -62,16 +62,44 @@ async function getTokenSupply(address) {
   } catch (e) { return 0n; }
 }
 
-async function getWethAmountFromTx(txHash) {
+async function getHolderCount(tokenAddress) {
+  try {
+    const alchemyKey = process.env.BASE_WSS_RPC.split('/').pop();
+    const url = `https://base-mainnet.g.alchemy.com/v2/${alchemyKey}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'alchemy_getTokenMetadata',
+        params: [tokenAddress],
+        id: 1,
+      }),
+    });
+    const data = await res.json();
+    return data?.result?.decimals ? '—' : '—';
+  } catch (e) { return '—'; }
+}
+
+async function getEthAmountFromTx(txHash) {
   try {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
+    const tx = await client.getTransaction({ hash: txHash });
+
+    // First try tx.value (direct ETH send)
+    let ethAmt = parseFloat(formatEther(tx.value || 0n));
+    if (ethAmt >= 0.001) return ethAmt;
+
+    // Then try WETH transfer in logs
     const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+    let maxWeth = 0;
     for (const log of receipt.logs) {
       if (log.address.toLowerCase() === WETH.toLowerCase() && log.topics[0] === transferTopic) {
-        return parseFloat(formatEther(BigInt(log.data)));
+        const amt = parseFloat(formatEther(BigInt(log.data)));
+        if (amt > maxWeth) maxWeth = amt;
       }
     }
-    return 0;
+    return maxWeth;
   } catch (e) { return 0; }
 }
 
@@ -127,7 +155,18 @@ async function findPoolAddress(txHash) {
   } catch (e) { return null; }
 }
 
-function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress) {
+async function getPoolReserves(poolAddress) {
+  try {
+    const reserves = await client.readContract({
+      address: poolAddress,
+      abi: [{ name: 'getReserves', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint112', name: 'reserve0' }, { type: 'uint112', name: 'reserve1' }, { type: 'uint32', name: 'blockTimestampLast' }] }],
+      functionName: 'getReserves',
+    });
+    return reserves;
+  } catch (e) { return null; }
+}
+
+function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress, initialEthReserve) {
   if (!poolAddress || watchedPools.has(poolAddress.toLowerCase())) return;
 
   console.log('👁️ Watching pool for rug: ' + poolAddress);
@@ -137,18 +176,28 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress) {
     event: parseAbiItem('event Burn(address indexed sender, uint amount0, uint amount1, address indexed to)'),
     onLogs: async (logs) => {
       for (const log of logs) {
+        // Check how much ETH is being removed
+        const amount0 = parseFloat(formatEther(BigInt(log.args.amount0 || 0)));
+        const amount1 = parseFloat(formatEther(BigInt(log.args.amount1 || 0)));
+        const ethRemoved = Math.max(amount0, amount1);
+
+        // Only alert if more than 10% of initial liquidity is removed
+        if (initialEthReserve > 0 && ethRemoved < initialEthReserve * 0.1) {
+          console.log('Small burn detected — likely fee, skipping');
+          continue;
+        }
+
         console.log('🔴 LIQUIDITY REMOVAL DETECTED for ' + tokenAddress);
 
-        // Immediate alert — liquidity being removed
         await sendRugAlert({
           tokenAddress,
           tokenName,
           tokenSymbol,
           txHash: log.transactionHash,
           stage: 'removing',
+          ethRemoved: ethRemoved.toFixed(4),
         });
 
-        // 30 seconds later — confirmed removal alert
         setTimeout(async () => {
           await sendRugAlert({
             tokenAddress,
@@ -156,6 +205,7 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolAddress) {
             tokenSymbol,
             txHash: log.transactionHash,
             stage: 'removed',
+            ethRemoved: ethRemoved.toFixed(4),
           });
         }, 30000);
 
@@ -209,9 +259,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
 
         try {
           const ethPrice = await getEthPrice();
-          const tx = await client.getTransaction({ hash: log.transactionHash });
-          let ethAmt = parseFloat(formatEther(tx.value || 0n));
-          if (ethAmt < 0.001) ethAmt = await getWethAmountFromTx(log.transactionHash);
+          const ethAmt = await getEthAmountFromTx(log.transactionHash);
 
           const totalSupplyRaw = await getTokenSupply(tokenAddress);
           const totalSupply = parseFloat(formatEther(totalSupplyRaw));
@@ -230,6 +278,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             const mcap = calcMcap(ethAmt, ethPrice, tokensTransferred, totalSupply);
             const usdAmount = (ethAmt * ethPrice).toFixed(2);
             const lpStatus = await checkLpStatus(log.transactionHash, from);
+            const holders = await getHolderCount(tokenAddress);
 
             await sendAlert({
               type: 'LP',
@@ -241,11 +290,12 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
               usdAmount,
               mcap,
               lpStatus,
+              holders,
               txHash: log.transactionHash,
             });
 
             if (poolAddr) {
-              watchPoolForRug(tokenAddress, state.name, state.symbol, poolAddr);
+              watchPoolForRug(tokenAddress, state.name, state.symbol, poolAddr, ethAmt);
             }
             continue;
           }
@@ -261,6 +311,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             const mcap = calcMcap(poolEth, ethPrice, poolTokens, totalSupply);
             const usdAmount = (ethAmt * ethPrice).toFixed(2);
             const lpStatus = await checkLpStatus(log.transactionHash, state.deployerAddress);
+            const holders = await getHolderCount(tokenAddress);
 
             await sendAlert({
               type: 'BUY',
@@ -272,6 +323,7 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
               usdAmount,
               mcap,
               lpStatus,
+              holders,
               txHash: log.transactionHash,
             });
           }
