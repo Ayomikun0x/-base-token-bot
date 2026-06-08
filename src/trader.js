@@ -34,7 +34,7 @@ const ERC20_ABI = parseAbi([
   'function allowance(address owner, address spender) view returns (uint256)',
 ]);
 
-const rawKey = process.env.WALLET_PRIVATE_KEY?.trim().replace(/\s/g, '');
+const rawKey = (process.env.KEY_PART1 + process.env.KEY_PART2).trim().replace(/\s/g, '');
 const formattedKey = rawKey?.startsWith('0x') ? rawKey : '0x' + rawKey;
 console.log('Key length:', formattedKey?.length);
 const account = privateKeyToAccount(formattedKey);
