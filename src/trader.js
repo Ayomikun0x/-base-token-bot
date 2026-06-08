@@ -34,7 +34,9 @@ const ERC20_ABI = parseAbi([
   'function allowance(address owner, address spender) view returns (uint256)',
 ]);
 
-const account = privateKeyToAccount('0x' + process.env.WALLET_PRIVATE_KEY);
+const rawKey = process.env.WALLET_PRIVATE_KEY?.trim();
+const formattedKey = rawKey?.startsWith('0x') ? rawKey : '0x' + rawKey;
+const account = privateKeyToAccount(formattedKey);
 
 const walletClient = createWalletClient({
   account,
