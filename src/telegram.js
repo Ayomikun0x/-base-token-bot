@@ -80,3 +80,47 @@ export async function sendRugAlert({ tokenAddress, tokenName, tokenSymbol, txHas
     disable_web_page_preview: true,
   });
 }
+
+export async function sendTradeAlert({ type, tokenName, tokenSymbol, tokenAddress, amountUsd, reason, pnlPercent, pnlUsd, txHash }) {
+
+  const key = txHash + type;
+  if (sentAlerts.has(key)) return;
+  sentAlerts.add(key);
+
+  let msg = '';
+
+  if (type === 'BUY') {
+    msg = [
+      '🤖 *Auto Buy Executed!*',
+      '',
+      `🪙 *Token:* ${tokenName} (${tokenSymbol})`,
+      `📍 *Contract:*`,
+      `\`${tokenAddress}\``,
+      `💰 *Amount:* $${amountUsd}`,
+      '',
+      `🔗 [Basescan](https://basescan.org/tx/${txHash}) | 📈 [GMGN](https://gmgn.ai/base/token/${tokenAddress})`,
+    ].join('\n');
+  }
+
+  if (type === 'SELL') {
+    const emoji = parseFloat(pnlPercent) > 0 ? '🟢' : '🔴';
+    msg = [
+      `🤖 *Auto Sell Executed!*`,
+      '',
+      `🪙 *Token:* ${tokenName} (${tokenSymbol})`,
+      `📍 *Contract:*`,
+      `\`${tokenAddress}\``,
+      `📊 *Reason:* ${reason}`,
+      `${emoji} *PnL:* ${pnlPercent}% ($${pnlUsd})`,
+      '',
+      `🔗 [Basescan](https://basescan.org/tx/${txHash})`,
+    ].join('\n');
+  }
+
+  if (!msg) return;
+
+  await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID, msg, {
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+  });
+}

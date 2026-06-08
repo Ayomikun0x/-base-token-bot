@@ -1,6 +1,7 @@
 import { createPublicClient, webSocket, parseAbiItem, formatEther } from 'viem';
-import { base } from 'viem/chains';
+import { base, baseSepolia } from 'viem/chains';
 import { sendAlert, sendRugAlert } from './telegram.js';
+import { autoBuy, emergencySell } from './trader.js';
 
 const watchedTokens = new Map();
 const watchedPools = new Map();
@@ -29,9 +30,10 @@ const DEX_ADDRESSES = [
 
 const WETH = '0x4200000000000000000000000000000000000006';
 const BASESCAN_API = 'https://api.etherscan.io/v2/api';
+const IS_TESTNET = process.env.RPC_URL?.includes('sepolia');
 
 export const client = createPublicClient({
-  chain: base,
+  chain: IS_TESTNET ? baseSepolia : base,
   transport: webSocket(process.env.BASE_WSS_RPC),
 });
 
@@ -82,11 +84,9 @@ async function getEthAmountFromTx(txHash) {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
     const tx = await client.getTransaction({ hash: txHash });
 
-    // Try tx.value first
     let ethAmt = parseFloat(formatEther(tx.value || 0n));
     if (ethAmt >= 0.001) return ethAmt;
 
-    // Try WETH transfers — get largest one
     const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
     let maxWeth = 0;
     for (const log of receipt.logs) {
@@ -97,7 +97,6 @@ async function getEthAmountFromTx(txHash) {
     }
     if (maxWeth >= 0.001) return maxWeth;
 
-    // Try Basescan internal transactions
     try {
       const apiKey = process.env.BASESCAN_API_KEY;
       const url = `${BASESCAN_API}?chainid=8453&module=account&action=txlistinternal&txhash=${txHash}&apikey=${apiKey}`;
@@ -160,39 +159,22 @@ async function findPoolAddress(tokenAddress, txHash) {
   try {
     const receipt = await client.getTransactionReceipt({ hash: txHash });
 
-    // V2 PairCreated event
-    const pairCreatedTopic = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
-    for (const log of receipt.logs) {
-      if (log.topics[0] === pairCreatedTopic) {
-        const poolAddr = '0x' + log.data.slice(26, 66);
-        console.log('Found V2 pool: ' + poolAddr);
-        return { address: poolAddr, version: 'v2' };
-      }
-    }
-
-    // V2 pool — check Sync event (always fires on LP creation)
     const syncTopic = '0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1';
     for (const log of receipt.logs) {
       if (log.topics[0] === syncTopic) {
-        console.log('Found V2 pool via Sync: ' + log.address);
         return { address: log.address, version: 'v2' };
       }
     }
 
-    // V4 pool — use Pool Manager address
     const v4InitTopic = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';
     for (const log of receipt.logs) {
       if (log.topics[0] === v4InitTopic) {
-        const poolId = log.topics[1];
-        console.log('Found V4 pool ID: ' + poolId);
-        return { address: '0x498581ff718922c3f8e6a244956af099b2652b2b', version: 'v4', poolId };
+        return { address: '0x498581ff718922c3f8e6a244956af099b2652b2b', version: 'v4', poolId: log.topics[1] };
       }
     }
 
     return null;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolInfo, initialEthReserve) {
@@ -201,12 +183,11 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolInfo, initial
   const poolKey = poolInfo.address.toLowerCase();
   if (watchedPools.has(poolKey)) return;
 
-  console.log('👁️ Watching pool for rug: ' + poolInfo.address + ' (version: ' + poolInfo.version + ')');
+  console.log('👁️ Watching pool for rug: ' + poolInfo.address);
 
   let unwatch;
 
   if (poolInfo.version === 'v2') {
-    // V2 — watch Burn event directly on pool
     unwatch = client.watchEvent({
       address: poolInfo.address,
       event: parseAbiItem('event Burn(address indexed sender, uint amount0, uint amount1, address indexed to)'),
@@ -216,28 +197,23 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolInfo, initial
           const amount1 = parseFloat(formatEther(BigInt(log.args.amount1 || 0)));
           const ethRemoved = Math.max(amount0, amount1);
 
-          // Only alert if significant liquidity removed (>5% of initial)
-          if (initialEthReserve > 0 && ethRemoved < initialEthReserve * 0.05) {
-            console.log('Small burn — likely fee, skipping (' + ethRemoved + ' ETH)');
-            continue;
-          }
+          if (initialEthReserve > 0 && ethRemoved < initialEthReserve * 0.05) continue;
 
-          console.log('🔴 V2 LIQUIDITY REMOVAL for ' + tokenAddress);
+          console.log('🔴 RUG DETECTED for ' + tokenAddress);
 
           await sendRugAlert({
-            tokenAddress,
-            tokenName,
-            tokenSymbol,
+            tokenAddress, tokenName, tokenSymbol,
             txHash: log.transactionHash,
             stage: 'removing',
             ethRemoved: ethRemoved.toFixed(4),
           });
 
+          // Emergency sell
+          await emergencySell(tokenAddress, tokenName, tokenSymbol);
+
           setTimeout(async () => {
             await sendRugAlert({
-              tokenAddress,
-              tokenName,
-              tokenSymbol,
+              tokenAddress, tokenName, tokenSymbol,
               txHash: log.transactionHash,
               stage: 'removed',
               ethRemoved: ethRemoved.toFixed(4),
@@ -250,34 +226,29 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolInfo, initial
       },
     });
   } else if (poolInfo.version === 'v4') {
-    // V4 — watch ModifyLiquidity with negative delta on Pool Manager
     unwatch = client.watchEvent({
       address: poolInfo.address,
       event: parseAbiItem('event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)'),
       onLogs: async (logs) => {
         for (const log of logs) {
-          // Only process events for our pool ID
           if (poolInfo.poolId && log.topics[1] !== poolInfo.poolId) continue;
-
           const delta = BigInt(log.args.liquidityDelta || 0);
-          if (delta >= 0n) continue; // Only negative = removal
+          if (delta >= 0n) continue;
 
-          console.log('🔴 V4 LIQUIDITY REMOVAL for ' + tokenAddress);
+          console.log('🔴 V4 RUG DETECTED for ' + tokenAddress);
 
           await sendRugAlert({
-            tokenAddress,
-            tokenName,
-            tokenSymbol,
+            tokenAddress, tokenName, tokenSymbol,
             txHash: log.transactionHash,
             stage: 'removing',
             ethRemoved: 'Unknown',
           });
 
+          await emergencySell(tokenAddress, tokenName, tokenSymbol);
+
           setTimeout(async () => {
             await sendRugAlert({
-              tokenAddress,
-              tokenName,
-              tokenSymbol,
+              tokenAddress, tokenName, tokenSymbol,
               txHash: log.transactionHash,
               stage: 'removed',
               ethRemoved: 'Unknown',
@@ -293,12 +264,10 @@ function watchPoolForRug(tokenAddress, tokenName, tokenSymbol, poolInfo, initial
 
   if (unwatch) {
     watchedPools.set(poolKey, unwatch);
-
     setTimeout(() => {
       if (watchedPools.has(poolKey)) {
         watchedPools.get(poolKey)?.();
         watchedPools.delete(poolKey);
-        console.log('Pool watch expired: ' + poolInfo.address);
       }
     }, 24 * 60 * 60 * 1000);
   }
@@ -308,15 +277,10 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
   if (watchedTokens.has(tokenAddress.toLowerCase())) return;
 
   watchedTokens.set(tokenAddress.toLowerCase(), {
-    deployBlock,
-    name,
-    symbol,
-    lpAlerted: false,
-    buyAlerted: false,
-    lpTokensInPool: 0,
-    lpEthAmount: 0,
-    poolInfo: null,
-    deployerAddress: null,
+    deployBlock, name, symbol,
+    lpAlerted: false, buyAlerted: false,
+    lpTokensInPool: 0, lpEthAmount: 0,
+    poolInfo: null, deployerAddress: null,
     unwatch: null,
   });
 
@@ -339,7 +303,6 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
         try {
           const ethPrice = await getEthPrice();
           const ethAmt = await getEthAmountFromTx(log.transactionHash);
-
           const totalSupplyRaw = await getTokenSupply(tokenAddress);
           const totalSupply = parseFloat(formatEther(totalSupplyRaw));
           const tokensTransferred = parseFloat(formatEther(log.args.value));
@@ -360,22 +323,16 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             const holders = await getHolderCount(tokenAddress);
 
             await sendAlert({
-              type: 'LP',
-              tokenAddress,
+              type: 'LP', tokenAddress,
               tokenName: state.name || 'Unknown',
               tokenSymbol: state.symbol || '???',
               walletAddress: from,
               ethAmount: ethAmt.toFixed(4),
-              usdAmount,
-              mcap,
-              lpStatus,
-              holders,
+              usdAmount, mcap, lpStatus, holders,
               txHash: log.transactionHash,
             });
 
-            if (poolInfo) {
-              watchPoolForRug(tokenAddress, state.name, state.symbol, poolInfo, ethAmt);
-            }
+            if (poolInfo) watchPoolForRug(tokenAddress, state.name, state.symbol, poolInfo, ethAmt);
             continue;
           }
 
@@ -393,18 +350,17 @@ export function watchToken(tokenAddress, deployBlock, name, symbol) {
             const holders = await getHolderCount(tokenAddress);
 
             await sendAlert({
-              type: 'BUY',
-              tokenAddress,
+              type: 'BUY', tokenAddress,
               tokenName: state.name || 'Unknown',
               tokenSymbol: state.symbol || '???',
               walletAddress: to,
               ethAmount: ethAmt.toFixed(4),
-              usdAmount,
-              mcap,
-              lpStatus,
-              holders,
+              usdAmount, mcap, lpStatus, holders,
               txHash: log.transactionHash,
             });
+
+            // Auto buy
+            await autoBuy(tokenAddress, state.name || 'Unknown', state.symbol || '???');
           }
 
         } catch (err) {
