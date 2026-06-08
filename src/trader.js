@@ -35,9 +35,6 @@ const ERC20_ABI = parseAbi([
 ]);
 
 const account = privateKeyToAccount('0xd3d5f92f49ae897f10d4039c0776b4765ccff489f80269bc6a6eda1f301b15de');
-const formattedKey = rawKey?.startsWith('0x') ? rawKey : '0x' + rawKey;
-console.log('Key length:', formattedKey?.length);
-const account = privateKeyToAccount(formattedKey);
 
 const walletClient = createWalletClient({
   account,
