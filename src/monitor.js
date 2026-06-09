@@ -9,7 +9,10 @@ const BASESCAN_KEY = process.env.BASESCAN_API_KEY;
 const MIN_LIQUIDITY = 5000;
 const UNISWAP_V2_FACTORY = '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC9';
 const WETH = '0x4200000000000000000000000000000000000006';
-const PAIR_CREATED_TOPIC = '0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9';
+
+const FACTORY_ABI = parseAbi([
+  'event PairCreated(address indexed token0, address indexed token1, address pair, uint)',
+]);
 
 const PAIR_ABI = parseAbi([
   'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
@@ -71,22 +74,19 @@ async function pollNewPairs() {
     const block = await client.getBlockNumber();
     const fromBlock = block - 10n;
 
-    const url = `https://api.basescan.org/v2/api?chainid=8453&module=logs&action=getLogs&address=${UNISWAP_V2_FACTORY}&topic0=${PAIR_CREATED_TOPIC}&fromBlock=${fromBlock}&toBlock=${block}&apikey=${BASESCAN_KEY}`;
-    const res = await fetch(url);
-    const data = await res.json();
+    const logs = await client.getLogs({
+      address: UNISWAP_V2_FACTORY,
+      event: FACTORY_ABI[0],
+      fromBlock,
+      toBlock: block,
+    });
 
-    if (!data.result || !Array.isArray(data.result) || data.result.length === 0) return;
-
-    for (const log of data.result) {
-      if (!log.topics || log.topics.length < 3) continue;
-      const pair = '0x' + log.data.slice(26, 66);
+    for (const log of logs) {
+      const { token0, token1, pair } = log.args;
       if (processedPairs.has(pair)) continue;
       processedPairs.add(pair);
 
-      const token0 = '0x' + log.topics[1].slice(26);
-      const token1 = '0x' + log.topics[2].slice(26);
       const tokenAddress = token0.toLowerCase() === WETH.toLowerCase() ? token1 : token0;
-
       const { name, symbol } = await getTokenMeta(tokenAddress);
       console.log('🪙 New ERC-20: ' + name + ' (' + symbol + ') at ' + tokenAddress);
 
