@@ -6,7 +6,7 @@ import { autoBuy } from './trader.js';
 const IS_TESTNET = process.env.RPC_URL?.includes('sepolia');
 const chain = IS_TESTNET ? baseSepolia : base;
 
-const BASESCAN_API = 'https://api.basescan.org/api';
+const BASESCAN_API = 'https://api.basescan.org/v2/api';
 const BASESCAN_KEY = process.env.BASESCAN_API_KEY;
 const MIN_LIQUIDITY = 5000;
 const UNISWAP_V2_FACTORY = '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC9';
