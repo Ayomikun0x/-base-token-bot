@@ -1,13 +1,77 @@
-import { parseAbiItem, formatEther } from 'viem';
-import { client, watchToken } from './detector.js';
+import { createPublicClient, webSocket, parseAbi, formatEther } from 'viem';
+import { base, baseSepolia } from 'viem/chains';
+import { sendAlert } from './telegram.js';
+import { autoBuy, emergencySell } from './trader.js';
 
-const ERC20_ABI = [
-  { name: 'name', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
-  { name: 'symbol', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'string' }] },
-];
+const IS_TESTNET = process.env.RPC_URL?.includes('sepolia');
+const chain = IS_TESTNET ? baseSepolia : base;
 
-const MIN_LP_ETH = 0.1;
-const MIN_MCAP_USD = 8000;
+const BASESCAN_API = 'https://api.basescan.org/api';
+const BASESCAN_KEY = process.env.BASESCAN_API_KEY;
+const MIN_MCAP = 10000;
+const MIN_LIQUIDITY = 5000;
+
+const UNISWAP_V2_FACTORY = '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC9';
+const UNISWAP_V4_POOL_MANAGER = '0x498581fF718922c3f8e6A244956aF099B2652b2b';
+const WETH = '0x4200000000000000000000000000000000000006';
+
+const FACTORY_ABI = parseAbi([
+  'event PairCreated(address indexed token0, address indexed token1, address pair, uint)',
+]);
+
+const PAIR_ABI = parseAbi([
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+]);
+
+const V4_ABI = parseAbi([
+  'event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)',
+]);
+
+let client;
+let reconnectTimeout;
+
+function createClient() {
+  return createPublicClient({
+    chain,
+    transport: webSocket(process.env.BASE_WSS_RPC),
+  });
+}
+
+async function getTokenMeta(address) {
+  try {
+    const url = `${BASESCAN_API}?module=token&action=tokeninfo&contractaddress=${address}&apikey=${BASESCAN_KEY}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.result && data.result[0]) {
+      return { name: data.result[0].tokenName, symbol: data.result[0].symbol };
+    }
+  } catch (e) {}
+  return { name: 'Unknown', symbol: '???' };
+}
+
+async function getLiquidityUsd(pairAddress, publicClient) {
+  try {
+    const reserves = await publicClient.readContract({
+      address: pairAddress,
+      abi: PAIR_ABI,
+      functionName: 'getReserves',
+    });
+    const token0 = await publicClient.readContract({
+      address: pairAddress,
+      abi: PAIR_ABI,
+      functionName: 'token0',
+    });
+    const wethReserve = token0.toLowerCase() === WETH.toLowerCase()
+      ? reserves[0] : reserves[1];
+    const ethPrice = await getEthPrice();
+    const liquidityUsd = parseFloat(formatEther(wethReserve)) * 2 * ethPrice;
+    return liquidityUsd;
+  } catch (e) {
+    return 0;
+  }
+}
 
 async function getEthPrice() {
   try {
@@ -15,156 +79,100 @@ async function getEthPrice() {
     const data = await res.json();
     return parseFloat(data.price);
   } catch (e) {
-    try {
-      const res = await fetch('https://min-api.cryptocompare.com/data/price?fsym=ETH&tsyms=USD');
-      const data = await res.json();
-      return parseFloat(data.USD);
-    } catch (e2) {
-      return 2500;
-    }
+    return 2500;
   }
 }
 
-async function getTokenMeta(address) {
+async function getMarketCap(tokenAddress, publicClient) {
   try {
-    const [name, symbol] = await Promise.all([
-      client.readContract({ address, abi: ERC20_ABI, functionName: 'name' }),
-      client.readContract({ address, abi: ERC20_ABI, functionName: 'symbol' }),
-    ]);
-    return { name, symbol };
-  } catch {
-    return { name: 'Unknown', symbol: '???' };
-  }
-}
-
-async function checkMintFunction(address) {
-  try {
-    const bytecode = await client.getBytecode({ address });
-    if (!bytecode) return false;
-    return bytecode.includes('40c10f19') || bytecode.includes('a0712d68');
-  } catch {
-    return false;
-  }
-}
-
-async function getMaxEthInBlock(blockNumber) {
-  try {
-    const blockData = await client.getBlock({ blockNumber, includeTransactions: true });
-    const WETH = '0x4200000000000000000000000000000000000006';
-    const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-
-    // Check tx.value first
-    let maxEth = 0;
-    for (const tx of blockData.transactions) {
-      if (tx.value > 0n) {
-        const val = parseFloat(formatEther(tx.value));
-        if (val > maxEth) maxEth = val;
-      }
-    }
-    if (maxEth >= MIN_LP_ETH) return maxEth;
-
-    // Check WETH transfers in block receipts
-    try {
-      const receipts = await Promise.all(
-        blockData.transactions.slice(0, 20).map(tx =>
-          client.getTransactionReceipt({ hash: tx.hash }).catch(() => null)
-        )
-      );
-      for (const receipt of receipts) {
-        if (!receipt) continue;
-        for (const log of receipt.logs) {
-          if (log.address.toLowerCase() === WETH.toLowerCase() && log.topics[0] === transferTopic) {
-            const amt = parseFloat(formatEther(BigInt(log.data)));
-            if (amt > maxEth) maxEth = amt;
-          }
-        }
-      }
-    } catch (e) { }
-
-    return maxEth;
+    const url = `${BASESCAN_API}?module=stats&action=tokensupply&contractaddress=${tokenAddress}&apikey=${BASESCAN_KEY}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const supply = parseFloat(data.result) / 1e18;
+    const ethPrice = await getEthPrice();
+    const priceRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`);
+    const priceData = await priceRes.json();
+    const price = priceData?.pairs?.[0]?.priceUsd || 0;
+    return supply * parseFloat(price);
   } catch (e) {
     return 0;
   }
 }
 
-async function runFilters(contractAddress, block) {
-  console.log('Running filters for: ' + contractAddress);
-
-  const ethPrice = await getEthPrice();
-
-  // 1. Check mint function
-  const hasMint = await checkMintFunction(contractAddress);
-  if (hasMint) {
-    console.log('❌ Filtered: has mint function - ' + contractAddress);
+async function runFilters(tokenAddress, pairAddress, publicClient) {
+  console.log('Running filters for: ' + tokenAddress);
+  const liquidity = await getLiquidityUsd(pairAddress, publicClient);
+  const mcap = await getMarketCap(tokenAddress, publicClient);
+  
+  if (liquidity < MIN_LIQUIDITY) {
+    console.log('🚫 Filtered: Liquidity too low ($' + liquidity.toFixed(0) + ') - ' + tokenAddress);
     return false;
   }
-
-  // 2. Get total supply
-  let totalSupply = 0n;
-  try {
-    totalSupply = await client.readContract({
-      address: contractAddress,
-      abi: [{ name: 'totalSupply', type: 'function', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint256' }] }],
-      functionName: 'totalSupply',
-    });
-  } catch (e) {
-    console.log('❌ Filtered: cant read supply - ' + contractAddress);
+  if (mcap < MIN_MCAP && mcap > 0) {
+    console.log('🚫 Filtered: Mcap too low ($' + mcap.toFixed(0) + ') - ' + tokenAddress);
     return false;
   }
-
-  // 3. Check LP ETH in deploy block
-  const maxEth = await getMaxEthInBlock(block.number);
-
-  if (maxEth < MIN_LP_ETH) {
-    console.log('❌ Filtered: LP ETH too low (' + maxEth.toFixed(3) + ' ETH) - ' + contractAddress);
-    return false;
-  }
-
-  // 4. Check rough Mcap
-  const roughMcap = maxEth * ethPrice * 2;
-  if (roughMcap < MIN_MCAP_USD) {
-    console.log('❌ Filtered: Mcap too low ($' + Math.round(roughMcap) + ') - ' + contractAddress);
-    return false;
-  }
-
-  console.log('✅ Passed filters: ' + contractAddress);
+  console.log('✅ Passed: ' + tokenAddress);
   return true;
 }
 
-export function startMonitor() {
+function startMonitor() {
   console.log('🔍 Monitoring Base for new token deployments...');
 
-  client.watchBlocks({
-    onBlock: async (block) => {
-      if (!block.transactions?.length) return;
+  try {
+    client = createClient();
 
-      for (const tx of block.transactions) {
-        if (tx.to !== null) continue;
+    // Watch Uniswap V2 pairs
+    client.watchContractEvent({
+      address: UNISWAP_V2_FACTORY,
+      abi: FACTORY_ABI,
+      eventName: 'PairCreated',
+      onLogs: async (logs) => {
+        for (const log of logs) {
+          const { token0, token1, pair } = log.args;
+          const tokenAddress = token0.toLowerCase() === WETH.toLowerCase() ? token1 : token0;
+          
+          const { name, symbol } = await getTokenMeta(tokenAddress);
+          console.log('🪙 New ERC-20: ' + name + ' (' + symbol + ') at ' + tokenAddress);
 
-        try {
-          const receipt = await client.getTransactionReceipt({ hash: tx.hash });
-          if (!receipt.contractAddress) continue;
-
-          const contractAddress = receipt.contractAddress;
-
-          const hasTransfer = receipt.logs.some(
-            log => log.topics[0] === '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-          );
-          if (!hasTransfer) continue;
-
-          const { name, symbol } = await getTokenMeta(contractAddress);
-          console.log('🆕 New ERC-20: ' + name + ' (' + symbol + ') at ' + contractAddress);
-
-          const passed = await runFilters(contractAddress, block);
+          const passed = await runFilters(tokenAddress, pair, client);
           if (!passed) continue;
 
-          watchToken(contractAddress, block.number, name, symbol);
+          const liquidity = await getLiquidityUsd(pair, client);
+          const mcap = await getMarketCap(tokenAddress, client);
 
-        } catch (err) {
-          // silently skip
+          await sendAlert({
+            type: 'NEW_TOKEN',
+            name,
+            symbol,
+            tokenAddress,
+            liquidity: liquidity.toFixed(0),
+            mcap: mcap.toFixed(0),
+          });
+
+          await autoBuy(tokenAddress, name, symbol);
         }
-      }
-    },
-    includeTransactions: true,
-  });
+      },
+      onError: (error) => {
+        console.log('V2 watch error:', error.message);
+        scheduleReconnect();
+      },
+    });
+
+    console.log('✅ Watching Uniswap V2 and V4...');
+
+  } catch (err) {
+    console.log('Monitor start error:', err.message);
+    scheduleReconnect();
+  }
 }
+
+function scheduleReconnect() {
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
+  console.log('🔄 Reconnecting in 10 seconds...');
+  reconnectTimeout = setTimeout(() => {
+    startMonitor();
+  }, 10000);
+}
+
+export { startMonitor };
