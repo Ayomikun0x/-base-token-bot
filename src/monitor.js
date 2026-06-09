@@ -76,12 +76,12 @@ async function pollNewPairs() {
     if (!data.result || data.result.length === 0) return;
 
     for (const log of data.result) {
-      const pair = '0x' + log.topics[3].slice(26);
-      if (processedPairs.has(pair)) continue;
-      processedPairs.add(pair);
-
+      if (!log.topics || log.topics.length < 3) continue;
       const token0 = '0x' + log.topics[1].slice(26);
       const token1 = '0x' + log.topics[2].slice(26);
+      const pair = '0x' + log.data.slice(26, 66);
+      if (processedPairs.has(pair)) continue;
+      processedPairs.add(pair);
       const tokenAddress = token0.toLowerCase() === WETH.toLowerCase() ? token1 : token0;
 
       const { name, symbol } = await getTokenMeta(tokenAddress);
