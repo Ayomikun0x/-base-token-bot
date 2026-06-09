@@ -72,6 +72,7 @@ async function pollNewPairs() {
     const url = `${BASESCAN_API}?module=logs&action=getLogs&address=${UNISWAP_V2_FACTORY}&topic0=0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9&page=1&offset=10&sort=desc&apikey=${BASESCAN_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
+    console.log('Basescan response:', JSON.stringify(data).slice(0, 200));
 
     if (!data.result || data.result.length === 0) return;
 
