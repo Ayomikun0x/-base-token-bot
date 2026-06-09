@@ -80,6 +80,7 @@ async function pollNewPairs() {
       fromBlock,
       toBlock: block,
     });
+    console.log('Checked blocks ' + fromBlock + ' to ' + block + ', found ' + logs.length + ' pairs');
 
     for (const log of logs) {
       const { token0, token1, pair } = log.args;
