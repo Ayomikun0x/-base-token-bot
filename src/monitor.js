@@ -121,5 +121,6 @@ async function pollNewPairs() {
 export function startMonitor() {
   console.log('🔍 Monitoring Base for new token deployments...');
   setInterval(pollNewPairs, 5000);
+setInterval(() => console.log('💓 Bot alive - ' + new Date().toISOString()), 30000);
   pollNewPairs();
 }
