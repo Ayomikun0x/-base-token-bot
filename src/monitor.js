@@ -8,18 +8,16 @@ const chain = IS_TESTNET ? baseSepolia : base;
 const BASESCAN_KEY = process.env.BASESCAN_API_KEY;
 const MIN_LIQUIDITY = 5000;
 
+const WETH = '0x4200000000000000000000000000000000000006';
 const UNISWAP_V2_FACTORY = '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC9';
 const AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
-const WETH = '0x4200000000000000000000000000000000000006';
 
-const V2_FACTORY_ABI = parseAbi([
+const V2_ABI = parseAbi([
   'event PairCreated(address indexed token0, address indexed token1, address pair, uint)',
 ]);
-
-const AERODROME_ABI = parseAbi([
+const AERO_ABI = parseAbi([
   'event PoolCreated(address indexed token0, address indexed token1, bool indexed stable, address pool, uint)',
 ]);
-
 const PAIR_ABI = parseAbi([
   'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
   'function token0() view returns (address)',
@@ -44,7 +42,7 @@ async function getEthPrice() {
 
 async function getTokenMeta(address) {
   try {
-    const url = `https://api.basescan.org/v2/api?chainid=8453&module=token&action=tokeninfo&contractaddress=${address}&apikey=${BASESCAN_KEY}`;
+    const url = `https://api.basescan.org/api?module=token&action=tokeninfo&contractaddress=${address}&apikey=${BASESCAN_KEY}`;
     const res = await fetch(url);
     const data = await res.json();
     if (data.result && data.result[0]) {
@@ -69,8 +67,11 @@ async function getLiquidityUsd(pairAddress) {
     const wethReserve = token0.toLowerCase() === WETH.toLowerCase()
       ? reserves[0] : reserves[1];
     const ethPrice = await getEthPrice();
-    return parseFloat(formatEther(wethReserve)) * 2 * ethPrice;
+    const liquidity = parseFloat(formatEther(wethReserve)) * 2 * ethPrice;
+    console.log('💧 Liquidity check: $' + liquidity.toFixed(0) + ' for ' + pairAddress);
+    return liquidity;
   } catch (e) {
+    console.log('❌ Liquidity error: ' + e.message);
     return 0;
   }
 }
@@ -80,40 +81,40 @@ async function processToken(tokenAddress, pairAddress, source) {
   processedPairs.add(pairAddress);
 
   const { name, symbol } = await getTokenMeta(tokenAddress);
-  console.log('🪙 New ERC-20 [' + source + ']: ' + name + ' (' + symbol + ') at ' + tokenAddress);
+  console.log('🪙 New token [' + source + ']: ' + name + ' (' + symbol + ') at ' + tokenAddress);
 
   const liquidity = await getLiquidityUsd(pairAddress);
   if (liquidity < MIN_LIQUIDITY) {
-    console.log('🚫 Filtered: Liquidity too low ($' + liquidity.toFixed(0) + ')');
+    console.log('🚫 Filtered: $' + liquidity.toFixed(0) + ' < $' + MIN_LIQUIDITY);
     return;
   }
 
-  console.log('✅ Passed: ' + tokenAddress);
-
-  await sendAlert({
-    type: 'NEW_TOKEN',
-    name,
-    symbol,
-    tokenAddress,
-    liquidity: liquidity.toFixed(0),
-    mcap: '0',
-  });
-
+  console.log('✅ Alert firing for: ' + name + ' (' + symbol + ')');
+  await sendAlert({ type: 'NEW_TOKEN', name, symbol, tokenAddress, liquidity: liquidity.toFixed(0), mcap: '0' });
   await autoBuy(tokenAddress, name, symbol);
 }
 
 async function pollNewPairs() {
   try {
     const block = await client.getBlockNumber();
-    const fromBlock = block - 100n;
+    const fromBlock = block - 5n;
 
-    // Check Uniswap V2
     const v2Logs = await client.getLogs({
       address: UNISWAP_V2_FACTORY,
-      event: V2_FACTORY_ABI[0],
+      event: V2_ABI[0],
       fromBlock,
       toBlock: block,
     });
+
+    const aeroLogs = await client.getLogs({
+      address: AERODROME_FACTORY,
+      event: AERO_ABI[0],
+      fromBlock,
+      toBlock: block,
+    });
+
+    const total = v2Logs.length + aeroLogs.length;
+    if (total > 0) console.log('🔎 Found ' + total + ' new pairs');
 
     for (const log of v2Logs) {
       const { token0, token1, pair } = log.args;
@@ -121,31 +122,20 @@ async function pollNewPairs() {
       await processToken(tokenAddress, pair, 'V2');
     }
 
-    // Check Aerodrome
-    const aeroLogs = await client.getLogs({
-      address: AERODROME_FACTORY,
-      event: AERODROME_ABI[0],
-      fromBlock,
-      toBlock: block,
-    });
-
     for (const log of aeroLogs) {
       const { token0, token1, pool } = log.args;
       const tokenAddress = token0.toLowerCase() === WETH.toLowerCase() ? token1 : token0;
       await processToken(tokenAddress, pool, 'Aerodrome');
     }
 
-    const total = v2Logs.length + aeroLogs.length;
-    if (total > 0) console.log('Found ' + total + ' new pairs in blocks ' + fromBlock + '-' + block);
-
   } catch (err) {
-    console.log('Poll error: ' + err.message);
+    console.log('⚠️ Poll error: ' + err.message);
   }
 }
 
 export function startMonitor() {
-  console.log('🔍 Monitoring Base for new token deployments...');
+  console.log('🔍 Monitoring Base (V2 + Aerodrome)...');
   setInterval(pollNewPairs, 5000);
-  setInterval(() => console.log('💓 Bot alive - ' + new Date().toISOString()), 60000);
+  setInterval(() => console.log('💓 Bot alive - ' + new Date().toISOString()), 30000);
   pollNewPairs();
 }
