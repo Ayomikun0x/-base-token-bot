@@ -72,7 +72,7 @@ async function getLiquidityUsd(pairAddress) {
 async function pollNewPairs() {
   try {
     const block = await client.getBlockNumber();
-    const fromBlock = block - 10n;
+    const fromBlock = block - 100n;
 
     const logs = await client.getLogs({
       address: UNISWAP_V2_FACTORY,
